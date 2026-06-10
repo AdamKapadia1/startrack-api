@@ -2,15 +2,23 @@ import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import axios from 'axios';
-import { getPassRecommendation, checkAndNotify } from './agents/passAgent.js';
+import { createClient } from '@supabase/supabase-js';
+import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
 
 dotenv.config();
 
-const OBS_LAT = 51.7957;
-const OBS_LON = -0.6572;
+const OBS_LAT    = 51.7957;
+const OBS_LON    = -0.6572;
 const OBS_ALT_KM = 0.148;
 const R_EARTH_KM = 6371.0;
 
+// ── Supabase client ──────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL    ?? '',
+  process.env.SUPABASE_ANON_KEY ?? ''
+);
+
+// ── Geometry helpers ─────────────────────────────────────────────────────────
 function toRad(deg: number) { return deg * Math.PI / 180; }
 function toDeg(rad: number) { return rad * 180 / Math.PI; }
 
@@ -19,48 +27,49 @@ function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: nu
   const latS = toRad(satLat), lonS = toRad(satLon);
   const rO = R_EARTH_KM + obsAltKm;
   const rS = R_EARTH_KM + satAltKm;
-
-  // Observer and satellite in ECEF
   const ox = rO * Math.cos(latO) * Math.cos(lonO);
   const oy = rO * Math.cos(latO) * Math.sin(lonO);
   const oz = rO * Math.sin(latO);
   const sx = rS * Math.cos(latS) * Math.cos(lonS);
   const sy = rS * Math.cos(latS) * Math.sin(lonS);
   const sz = rS * Math.sin(latS);
-
-  // Range vector in ECEF
   const dx = sx - ox, dy = sy - oy, dz = sz - oz;
   const range = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-  // Rotate into local South-East-Up frame at observer
   const sinLat = Math.sin(latO), cosLat = Math.cos(latO);
   const sinLon = Math.sin(lonO), cosLon = Math.cos(lonO);
   const south  = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
   const east   = -sinLon * dx + cosLon * dy;
   const up     =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
-
   const elevation = toDeg(Math.asin(up / range));
   const azimuth   = (toDeg(Math.atan2(east, -south)) + 360) % 360;
   return { elevation, azimuth, range };
 }
 
-// In-memory cache for the visible-satellites response (5-minute TTL).
-// Prevents hammering N2YO /above on every frontend poll.
+function signalScore(satellites: Array<{ elevation: number }>): number {
+  if (!satellites.length) return 0;
+  const best = Math.max(...satellites.map(s => s.elevation));
+  const avg  = satellites.reduce((s, x) => s + x.elevation, 0) / satellites.length;
+  return Math.min(100, Math.round(satellites.length * 6 + avg * 0.4 + (best > 60 ? 15 : best > 30 ? 8 : 0)));
+}
+
+// ── In-memory caches ─────────────────────────────────────────────────────────
 let _visibleCache: { payload: object; fetchedAt: number } | null = null;
 const VISIBLE_TTL_S = 5 * 60;
 
+let _weatherCache: { payload: object; fetchedAt: number } | null = null;
+const WEATHER_TTL_S = 10 * 60;
+
+// ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
-}));
+app.use(cors({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
+// ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok' });
 });
 
+// ── Visible satellites (Starlink cat 52 + OneWeb cat 53) ─────────────────────
 app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
   const now = Math.floor(Date.now() / 1000);
   if (_visibleCache && (now - _visibleCache.fetchedAt) < VISIBLE_TTL_S) {
@@ -74,8 +83,8 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
 
   try {
     const [starlinkRes, onewebRes] = await Promise.allSettled([
-      axios.get(aboveUrl(52), { timeout: 30000 }),  // Starlink
-      axios.get(aboveUrl(53), { timeout: 30000 }),  // OneWeb
+      axios.get(aboveUrl(52), { timeout: 30000 }),
+      axios.get(aboveUrl(53), { timeout: 30000 }),
     ]);
 
     const rawSats: any[] = [];
@@ -83,7 +92,6 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
       if (r.status === 'fulfilled') rawSats.push(...(r.value.data.above ?? []));
     }
 
-    // Deduplicate by name, compute look-angles, sort by elevation desc.
     const seen = new Set<string>();
     const satellites = rawSats
       .filter(sat => { if (seen.has(sat.satname)) return false; seen.add(sat.satname); return true; })
@@ -108,11 +116,58 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
     };
     _visibleCache = { payload, fetchedAt: now };
     res.json(payload);
+
+    // Fire-and-forget: log snapshot to Supabase for historical charting.
+    const maxEl = satellites.length ? Math.max(...satellites.map(s => s.elevation)) : 0;
+    const score = signalScore(satellites);
+    supabase.from('pass_predictions').insert({
+      norad_id:      0,
+      user_lat:      OBS_LAT,
+      user_lon:      OBS_LON,
+      aos_time:      new Date().toISOString(),
+      max_elevation: maxEl,
+      signal_score:  score,
+      computed_at:   new Date().toISOString(),
+    }).then(({ error }) => {
+      if (error) console.error('[supabase] insert failed:', error.message);
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ── Weather ──────────────────────────────────────────────────────────────────
+app.get('/api/weather', async (_req: Request, res: Response) => {
+  const now = Math.floor(Date.now() / 1000);
+  if (_weatherCache && (now - _weatherCache.fetchedAt) < WEATHER_TTL_S) {
+    res.json(_weatherCache.payload);
+    return;
+  }
+
+  const OWM_KEY = process.env.OPENWEATHER_API_KEY ?? '972df7e7ae348374ec129fe9d7f2e5bd';
+  try {
+    const { data } = await axios.get(
+      `https://api.openweathermap.org/data/2.5/weather?lat=${OBS_LAT}&lon=${OBS_LON}&appid=${OWM_KEY}&units=metric`,
+      { timeout: 15000 }
+    );
+
+    const cloudCover = data.clouds?.all ?? 0;
+    const payload = {
+      temp:               Math.round(data.main?.temp ?? 0),
+      description:        data.weather?.[0]?.description ?? '',
+      cloudCover,
+      windSpeed:          Math.round((data.wind?.speed ?? 0) * 10) / 10,
+      visibility:         data.visibility ?? 10000,
+      isGoodForSatellites: cloudCover < 50,
+    };
+    _weatherCache = { payload, fetchedAt: now };
+    res.json(payload);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI recommendation ────────────────────────────────────────────────────────
 app.get('/api/recommendation', async (_req: Request, res: Response) => {
   try {
     const result = await getPassRecommendation();
@@ -122,6 +177,7 @@ app.get('/api/recommendation', async (_req: Request, res: Response) => {
   }
 });
 
+// ── Notification check ───────────────────────────────────────────────────────
 app.get('/api/notifications/check', async (_req: Request, res: Response) => {
   try {
     const result = await checkAndNotify();
@@ -131,6 +187,34 @@ app.get('/api/notifications/check', async (_req: Request, res: Response) => {
   }
 });
 
+// ── ntfy.sh subscribe info ───────────────────────────────────────────────────
+app.get('/api/notifications/subscribe', (_req: Request, res: Response) => {
+  res.json({
+    topic:        'startrack-tring-alerts',
+    url:          NTFY_SUBSCRIBE_URL,
+    webUrl:       `${NTFY_SUBSCRIBE_URL}/`,
+    instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts. Or open the web URL in any browser.',
+  });
+});
+
+// ── Historical pass data (last 48 h) ─────────────────────────────────────────
+app.get('/api/history', async (_req: Request, res: Response) => {
+  try {
+    const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('pass_predictions')
+      .select('computed_at, signal_score, max_elevation')
+      .gte('computed_at', since)
+      .order('computed_at', { ascending: true });
+
+    if (error) throw new Error(error.message);
+    res.json(data ?? []);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Server start ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ?? 3001;
 
 app.listen(PORT, () => {
@@ -138,7 +222,7 @@ app.listen(PORT, () => {
   setInterval(async () => {
     try {
       const { alerted } = await checkAndNotify();
-      if (alerted > 0) console.log(`[notifications] sent ${alerted} alert(s)`);
+      if (alerted > 0) console.log(`[notifications] sent ${alerted} ntfy alert(s)`);
     } catch (err: any) {
       console.error('[notifications] check failed:', err.message);
     }

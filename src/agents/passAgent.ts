@@ -1,11 +1,13 @@
 import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
-import notifier from 'node-notifier';
 
 const N2YO_KEY  = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
 const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
 const OBS       = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
-const MIN_PASS_EL = 30; // minimum elevation for pass results (degrees)
+const MIN_PASS_EL = 30;
+
+const NTFY_TOPIC = 'startrack-tring-alerts';
+const NTFY_URL   = `https://ntfy.sh/${NTFY_TOPIC}`;
 
 export interface Pass {
   startUTC: number;
@@ -47,11 +49,7 @@ export interface NotificationCheckResult {
   alerts: NotificationAlert[];
 }
 
-// ── Curated Starlink satellite list ─────────────────────────────────────────
-// Drawn from 14 different launch batches → different orbital planes → good
-// pass coverage over UK at all hours. Verified active via Celestrak SATCAT.
-// No N2YO /above call needed — eliminates the high-transaction-cost discovery.
-
+// ── Curated Starlink satellites — diverse launch batches → orbital planes ─────
 interface SatEntry { satid: number; satname: string; }
 
 const STARLINK_SATS: SatEntry[] = [
@@ -72,10 +70,8 @@ const STARLINK_SATS: SatEntry[] = [
 ];
 
 // ── Pass cache (1-hour TTL) ──────────────────────────────────────────────────
-// checkAndNotify runs every 60 s — caching prevents 14 × 60 = 840 N2YO calls/hr.
-
 let _passesCache: { data: Pass[]; fetchedAt: number } | null = null;
-const PASSES_TTL_S = 60 * 60; // 1 hour
+const PASSES_TTL_S = 60 * 60;
 
 async function fetchPassesForSat(satid: number, satname: string): Promise<Pass[]> {
   const url = `${N2YO_BASE}/radiopasses/${satid}/${OBS.lat}/${OBS.lon}/${OBS.alt}/1/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
@@ -112,6 +108,24 @@ async function getAllStarlinkPasses(): Promise<Pass[]> {
   return sorted;
 }
 
+// ── ntfy.sh push notification ────────────────────────────────────────────────
+
+async function sendNtfy(satname: string, maxEl: number, minutesAway: number): Promise<void> {
+  await axios.post(
+    NTFY_URL,
+    `${satname} passes at ${Math.round(maxEl)}° in ${minutesAway} min — good connectivity window`,
+    {
+      headers: {
+        'Title':        'StarTrack Alert',
+        'Priority':     'high',
+        'Tags':         'satellite',
+        'Content-Type': 'text/plain',
+      },
+      timeout: 10000,
+    }
+  );
+}
+
 // ── Public: alert on imminent high-elevation Starlink passes ─────────────────
 
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
@@ -129,11 +143,11 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
     ) {
       notifiedPasses.add(pass.startUTC);
       const minutesAway = Math.max(1, Math.round((pass.startUTC - now) / 60));
-      notifier.notify({
-        title:   'StarTrack',
-        message: `${pass.satname} passes at ${Math.round(pass.maxEl)}° in ${minutesAway} min. Good Starlink window.`,
-        sound:   true,
-      });
+      try {
+        await sendNtfy(pass.satname, pass.maxEl, minutesAway);
+      } catch (err: any) {
+        console.error('[ntfy] push failed:', err.message);
+      }
       alerts.push({ satname: pass.satname, maxEl: pass.maxEl, minutesAway, startUTC: pass.startUTC });
     }
   }
@@ -189,3 +203,6 @@ export async function getPassRecommendation(): Promise<PassRecommendation> {
 
   return { recommendation, satname: topPasses[0].satname, topPasses };
 }
+
+// ── Exported constant for subscribe endpoint ─────────────────────────────────
+export const NTFY_SUBSCRIBE_URL = NTFY_URL;
