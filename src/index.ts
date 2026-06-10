@@ -57,23 +57,39 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
+  const N2YO_KEY = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
+  const aboveUrl = (cat: number) =>
+    `https://api.n2yo.com/rest/v1/satellite/above/${OBS_LAT}/${OBS_LON}/148/10/${cat}/&apiKey=${N2YO_KEY}`;
+
   try {
-    const { data } = await axios.get(
-      'https://api.n2yo.com/rest/v1/satellite/above/51.7957/-0.6572/148/10/52/&apiKey=GMVRQ4-MY5LN2-UZUBTB-5RSS',
-      { timeout: 30000 }
-    );
-    const satellites = (data.above ?? []).map((sat: any) => {
-      const { elevation, azimuth, range } = lookAngles(
-        OBS_LAT, OBS_LON, OBS_ALT_KM,
-        sat.satlat, sat.satlng, sat.satalt
-      );
-      return {
-        satname: sat.satname,
-        elevation: Math.round(elevation * 10) / 10,
-        azimuth: Math.round(azimuth * 10) / 10,
-        range: Math.round(range),
-      };
-    });
+    const [starlinkRes, onewebRes] = await Promise.allSettled([
+      axios.get(aboveUrl(52), { timeout: 30000 }),  // Starlink
+      axios.get(aboveUrl(53), { timeout: 30000 }),  // OneWeb
+    ]);
+
+    const rawSats: any[] = [];
+    for (const r of [starlinkRes, onewebRes]) {
+      if (r.status === 'fulfilled') rawSats.push(...(r.value.data.above ?? []));
+    }
+
+    // Deduplicate by name, compute look-angles, sort by elevation desc.
+    const seen = new Set<string>();
+    const satellites = rawSats
+      .filter(sat => { if (seen.has(sat.satname)) return false; seen.add(sat.satname); return true; })
+      .map(sat => {
+        const { elevation, azimuth, range } = lookAngles(
+          OBS_LAT, OBS_LON, OBS_ALT_KM,
+          sat.satlat, sat.satlng, sat.satalt
+        );
+        return {
+          satname:   sat.satname,
+          elevation: Math.round(elevation * 10) / 10,
+          azimuth:   Math.round(azimuth * 10) / 10,
+          range:     Math.round(range),
+        };
+      })
+      .sort((a, b) => b.elevation - a.elevation);
+
     res.json({
       location: { name: 'Tring, Hertfordshire', lat: OBS_LAT, lon: OBS_LON },
       count: satellites.length,

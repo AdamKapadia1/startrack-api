@@ -2,8 +2,12 @@ import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 import notifier from 'node-notifier';
 
-const N2YO_URL =
-  'https://api.n2yo.com/rest/v1/satellite/radiopasses/25544/51.7957/-0.6572/148/1/40/&apiKey=GMVRQ4-MY5LN2-UZUBTB-5RSS';
+const N2YO_KEY  = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
+const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
+const OBS       = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
+const STARLINK_CAT  = 52;
+const MAX_SATS      = 5;   // how many Starlink birds to query passes for
+const MIN_PASS_EL   = 30;  // minimum elevation for radio passes (degrees)
 
 export interface Pass {
   startUTC: number;
@@ -13,6 +17,7 @@ export interface Pass {
   startAz: number;
   maxAz: number;
   duration: number;
+  satname: string;
 }
 
 export interface PassRecommendation {
@@ -29,7 +34,7 @@ function utcToLocal(utc: number): string {
   });
 }
 
-// Tracks passes we've already notified about (keyed by startUTC) to avoid duplicates.
+// Deduplication set keyed by startUTC to avoid repeat notifications.
 const notifiedPasses = new Set<number>();
 
 export interface NotificationAlert {
@@ -45,11 +50,57 @@ export interface NotificationCheckResult {
   alerts: NotificationAlert[];
 }
 
+// ── Step 1: get currently-overhead Starlink NORAD IDs ───────────────────────
+
+async function fetchStarlinkSats(): Promise<Array<{ satid: number; satname: string }>> {
+  // search_radius=90 captures everything above the horizon (zenith±90°)
+  const url = `${N2YO_BASE}/above/${OBS.lat}/${OBS.lon}/${OBS.alt}/90/${STARLINK_CAT}/&apiKey=${N2YO_KEY}`;
+  const { data } = await axios.get(url, { timeout: 30000 });
+  return ((data.above ?? []) as any[])
+    .slice(0, MAX_SATS)
+    .map(s => ({ satid: s.satid as number, satname: s.satname as string }));
+}
+
+// ── Step 2: get radio passes for one satellite ───────────────────────────────
+
+async function fetchPassesForSat(satid: number, satname: string): Promise<Pass[]> {
+  const url = `${N2YO_BASE}/radiopasses/${satid}/${OBS.lat}/${OBS.lon}/${OBS.alt}/1/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
+  const { data } = await axios.get(url, { timeout: 30000 });
+  return ((data.passes ?? []) as any[]).map(p => ({
+    startUTC: p.startUTC as number,
+    maxUTC:   p.maxUTC   as number,
+    endUTC:   p.endUTC   as number,
+    maxEl:    p.maxEl    as number,
+    startAz:  p.startAz  as number,
+    maxAz:    p.maxAz    as number,
+    duration: (p.duration ?? (p.endUTC - p.startUTC)) as number,
+    satname,
+  }));
+}
+
+// ── Combined: fetch overhead Starlinks → their passes → sort by maxEl ────────
+
+async function getAllStarlinkPasses(): Promise<Pass[]> {
+  const sats = await fetchStarlinkSats();
+  if (!sats.length) return [];
+
+  const results = await Promise.allSettled(
+    sats.map(({ satid, satname }) => fetchPassesForSat(satid, satname))
+  );
+
+  const allPasses: Pass[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') allPasses.push(...r.value);
+  }
+
+  return allPasses.sort((a, b) => b.maxEl - a.maxEl);
+}
+
+// ── Public: check for imminent high-elevation passes and notify ───────────────
+
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
-  const { data } = await axios.get(N2YO_URL, { timeout: 30000 });
-  const satname: string = data.info?.satname ?? 'ISS';
-  const passes: Pass[] = data.passes ?? [];
-  const now = Math.floor(Date.now() / 1000);
+  const passes = await getAllStarlinkPasses();
+  const now       = Math.floor(Date.now() / 1000);
   const windowEnd = now + 10 * 60;
   const alerts: NotificationAlert[] = [];
 
@@ -62,40 +113,51 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
     ) {
       notifiedPasses.add(pass.startUTC);
       const minutesAway = Math.max(1, Math.round((pass.startUTC - now) / 60));
-      const message = `StarTrack Alert: ${satname} passes at ${Math.round(pass.maxEl)} degrees in ${minutesAway} minutes. Good connectivity window.`;
-      notifier.notify({ title: 'StarTrack', message, sound: true });
-      alerts.push({ satname, maxEl: pass.maxEl, minutesAway, startUTC: pass.startUTC });
+      notifier.notify({
+        title:   'StarTrack',
+        message: `${pass.satname} passes at ${Math.round(pass.maxEl)}° in ${minutesAway} min. Good Starlink window.`,
+        sound:   true,
+      });
+      alerts.push({ satname: pass.satname, maxEl: pass.maxEl, minutesAway, startUTC: pass.startUTC });
     }
   }
 
   return { checked: passes.length, alerted: alerts.length, alerts };
 }
 
-export async function getPassRecommendation(): Promise<PassRecommendation> {
-  const { data } = await axios.get(N2YO_URL, { timeout: 30000 });
+// ── Public: AI recommendation over upcoming Starlink passes ─────────────────
 
-  const allPasses: Pass[] = data.passes ?? [];
-  const topPasses = allPasses.slice(0, 5);
+export async function getPassRecommendation(): Promise<PassRecommendation> {
+  const allPasses = await getAllStarlinkPasses();
+  const topPasses = allPasses.slice(0, 10);
+
+  if (!topPasses.length) {
+    return {
+      recommendation: 'No Starlink passes found in the next 24 hours over Tring. Check your N2YO API key and observer coordinates.',
+      satname:   'Starlink',
+      topPasses: [],
+    };
+  }
 
   const passDescriptions = topPasses
+    .slice(0, 5)
     .map((p, i) => {
-      const start    = utcToLocal(p.startUTC);
-      const peak     = utcToLocal(p.maxUTC);
-      const duration = p.duration ?? (p.endUTC - p.startUTC);
-      return `Pass ${i + 1}: starts ${start}, peak at ${peak} with max elevation ${p.maxEl}°, duration ${duration}s`;
+      const start = utcToLocal(p.startUTC);
+      const peak  = utcToLocal(p.maxUTC);
+      return `Pass ${i + 1}: ${p.satname}, starts ${start}, peaks ${peak} at ${p.maxEl}°, duration ${p.duration}s`;
     })
     .join('\n');
 
   const client = new Anthropic();
 
   const stream = client.messages.stream({
-    model: 'claude-opus-4-8',
+    model:      'claude-opus-4-8',
     max_tokens: 256,
-    thinking: { type: 'adaptive' },
+    thinking:   { type: 'adaptive' },
     messages: [
       {
-        role: 'user',
-        content: `You are a satellite connectivity advisor. Here are the next ISS/Starlink passes over Tring, UK:\n\n${passDescriptions}\n\nWrite a single, plain-English recommendation (2–3 sentences) identifying the best connectivity window and what it's ideal for. Be specific about the time and elevation.`,
+        role:    'user',
+        content: `You are a satellite connectivity assistant tracking Starlink satellites over Tring, Hertfordshire. Here are the next upcoming Starlink passes:\n\n${passDescriptions}\n\nWrite a single plain-English recommendation (2–3 sentences) identifying the best connectivity window and what it is ideal for. Name the specific satellite, time and elevation.`,
       },
     ],
   });
@@ -104,11 +166,8 @@ export async function getPassRecommendation(): Promise<PassRecommendation> {
 
   let recommendation = '';
   for (const block of response.content) {
-    if (block.type === 'text') {
-      recommendation = block.text;
-      break;
-    }
+    if (block.type === 'text') { recommendation = block.text; break; }
   }
 
-  return { recommendation, satname: data.info?.satname ?? 'ISS', topPasses };
+  return { recommendation, satname: topPasses[0].satname, topPasses };
 }
