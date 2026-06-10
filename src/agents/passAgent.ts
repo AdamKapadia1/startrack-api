@@ -5,9 +5,9 @@ import notifier from 'node-notifier';
 const N2YO_KEY  = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
 const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
 const OBS       = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
-const STARLINK_CAT  = 52;
-const MAX_SATS      = 5;   // how many Starlink birds to query passes for
-const MIN_PASS_EL   = 30;  // minimum elevation for radio passes (degrees)
+const STARLINK_CAT = 52;
+const MAX_SATS     = 5;   // how many overhead Starlinks to query passes for
+const MIN_PASS_EL  = 30;  // minimum elevation for pass results (degrees)
 
 export interface Pass {
   startUTC: number;
@@ -34,7 +34,7 @@ function utcToLocal(utc: number): string {
   });
 }
 
-// Deduplication set keyed by startUTC to avoid repeat notifications.
+// Deduplication set keyed by startUTC to avoid repeat desktop notifications.
 const notifiedPasses = new Set<number>();
 
 export interface NotificationAlert {
@@ -50,18 +50,29 @@ export interface NotificationCheckResult {
   alerts: NotificationAlert[];
 }
 
-// ── Step 1: get currently-overhead Starlink NORAD IDs ───────────────────────
+// ── In-memory cache for overhead Starlink satellite list ─────────────────────
+// search_radius=10 means elevation > 10° (N2YO param is minimum elevation angle).
+// Refreshed every 15 minutes to avoid burning N2YO transactions.
 
-async function fetchStarlinkSats(): Promise<Array<{ satid: number; satname: string }>> {
-  // search_radius=90 captures everything above the horizon (zenith±90°)
-  const url = `${N2YO_BASE}/above/${OBS.lat}/${OBS.lon}/${OBS.alt}/90/${STARLINK_CAT}/&apiKey=${N2YO_KEY}`;
+interface SatEntry { satid: number; satname: string; }
+let _satsCache: { data: SatEntry[]; fetchedAt: number } | null = null;
+const SATS_TTL_S = 15 * 60;
+
+async function fetchStarlinkSats(): Promise<SatEntry[]> {
+  const now = Math.floor(Date.now() / 1000);
+  if (_satsCache && (now - _satsCache.fetchedAt) < SATS_TTL_S) {
+    return _satsCache.data;
+  }
+  const url = `${N2YO_BASE}/above/${OBS.lat}/${OBS.lon}/${OBS.alt}/10/${STARLINK_CAT}/&apiKey=${N2YO_KEY}`;
   const { data } = await axios.get(url, { timeout: 30000 });
-  return ((data.above ?? []) as any[])
+  const sats: SatEntry[] = ((data.above ?? []) as any[])
     .slice(0, MAX_SATS)
     .map(s => ({ satid: s.satid as number, satname: s.satname as string }));
+  _satsCache = { data: sats, fetchedAt: now };
+  return sats;
 }
 
-// ── Step 2: get radio passes for one satellite ───────────────────────────────
+// ── Get radio passes for one satellite ──────────────────────────────────────
 
 async function fetchPassesForSat(satid: number, satname: string): Promise<Pass[]> {
   const url = `${N2YO_BASE}/radiopasses/${satid}/${OBS.lat}/${OBS.lon}/${OBS.alt}/1/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
@@ -99,7 +110,7 @@ async function getAllStarlinkPasses(): Promise<Pass[]> {
 // ── Public: check for imminent high-elevation passes and notify ───────────────
 
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
-  const passes = await getAllStarlinkPasses();
+  const passes    = await getAllStarlinkPasses();
   const now       = Math.floor(Date.now() / 1000);
   const windowEnd = now + 10 * 60;
   const alerts: NotificationAlert[] = [];
@@ -133,7 +144,7 @@ export async function getPassRecommendation(): Promise<PassRecommendation> {
 
   if (!topPasses.length) {
     return {
-      recommendation: 'No Starlink passes found in the next 24 hours over Tring. Check your N2YO API key and observer coordinates.',
+      recommendation: 'No Starlink passes found in the next 24 hours over Tring. This may be a temporary gap — the constellation will return shortly.',
       satname:   'Starlink',
       topPasses: [],
     };

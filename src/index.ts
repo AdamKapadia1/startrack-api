@@ -44,6 +44,11 @@ function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: nu
   return { elevation, azimuth, range };
 }
 
+// In-memory cache for the visible-satellites response (5-minute TTL).
+// Prevents hammering N2YO /above on every frontend poll.
+let _visibleCache: { payload: object; fetchedAt: number } | null = null;
+const VISIBLE_TTL_S = 5 * 60;
+
 const app = express();
 app.use(cors({
   origin: true,
@@ -57,6 +62,12 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
+  const now = Math.floor(Date.now() / 1000);
+  if (_visibleCache && (now - _visibleCache.fetchedAt) < VISIBLE_TTL_S) {
+    res.json(_visibleCache.payload);
+    return;
+  }
+
   const N2YO_KEY = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
   const aboveUrl = (cat: number) =>
     `https://api.n2yo.com/rest/v1/satellite/above/${OBS_LAT}/${OBS_LON}/148/10/${cat}/&apiKey=${N2YO_KEY}`;
@@ -90,11 +101,13 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
       })
       .sort((a, b) => b.elevation - a.elevation);
 
-    res.json({
+    const payload = {
       location: { name: 'Tring, Hertfordshire', lat: OBS_LAT, lon: OBS_LON },
       count: satellites.length,
       satellites,
-    });
+    };
+    _visibleCache = { payload, fetchedAt: now };
+    res.json(payload);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
