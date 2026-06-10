@@ -46,7 +46,7 @@ function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: nu
 
 const app = express();
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://*.vercel.app', '*'],
+  origin: true,
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type'],
 }));
