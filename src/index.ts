@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
+import cors from 'cors';
 import axios from 'axios';
 import { getPassRecommendation, checkAndNotify } from './agents/passAgent.js';
 
@@ -44,6 +45,11 @@ function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: nu
 }
 
 const app = express();
+app.use(cors({
+  origin: ['http://localhost:5173', 'https://*.vercel.app', '*'],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type'],
+}));
 app.use(express.json());
 
 app.get('/health', (_req: Request, res: Response) => {
