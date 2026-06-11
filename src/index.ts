@@ -182,7 +182,10 @@ const app = express();
 app.use(cors({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({
+  status: 'ok',
+  hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+}));
 
 app.get('/api/tles/status', async (_req, res) => {
   try { await getActiveSatellites(50); res.json(getTleStatus()); }

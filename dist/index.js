@@ -148,7 +148,10 @@ async function getWeatherData(lat, lon) {
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express_1.default.json());
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({
+    status: 'ok',
+    hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+}));
 app.get('/api/tles/status', async (_req, res) => {
     try {
         await (0, tleCache_js_1.getActiveSatellites)(50);
