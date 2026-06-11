@@ -12,11 +12,12 @@ const OBS_LON    = -0.6572;
 const OBS_ALT_KM = 0.148;
 const R_EARTH_KM = 6371.0;
 
-// ── Supabase client ──────────────────────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL    ?? '',
-  process.env.SUPABASE_ANON_KEY ?? ''
-);
+// ── Supabase client (null-safe — won't crash if env vars are missing) ────────
+const _supabaseUrl = process.env.SUPABASE_URL ?? '';
+const _supabaseKey = process.env.SUPABASE_ANON_KEY ?? '';
+const supabase = _supabaseUrl && _supabaseKey
+  ? createClient(_supabaseUrl, _supabaseKey)
+  : null;
 
 // ── Geometry helpers ─────────────────────────────────────────────────────────
 function toRad(deg: number) { return deg * Math.PI / 180; }
@@ -118,19 +119,21 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
     res.json(payload);
 
     // Fire-and-forget: log snapshot to Supabase for historical charting.
-    const maxEl = satellites.length ? Math.max(...satellites.map(s => s.elevation)) : 0;
-    const score = signalScore(satellites);
-    supabase.from('pass_predictions').insert({
-      norad_id:      0,
-      user_lat:      OBS_LAT,
-      user_lon:      OBS_LON,
-      aos_time:      new Date().toISOString(),
-      max_elevation: maxEl,
-      signal_score:  score,
-      computed_at:   new Date().toISOString(),
-    }).then(({ error }) => {
-      if (error) console.error('[supabase] insert failed:', error.message);
-    });
+    if (supabase) {
+      const maxEl = satellites.length ? Math.max(...satellites.map(s => s.elevation)) : 0;
+      const score = signalScore(satellites);
+      supabase.from('pass_predictions').insert({
+        norad_id:      0,
+        user_lat:      OBS_LAT,
+        user_lon:      OBS_LON,
+        aos_time:      new Date().toISOString(),
+        max_elevation: maxEl,
+        signal_score:  score,
+        computed_at:   new Date().toISOString(),
+      }).then(({ error }) => {
+        if (error) console.error('[supabase] insert failed:', error.message);
+      });
+    }
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -199,6 +202,7 @@ app.get('/api/notifications/subscribe', (_req: Request, res: Response) => {
 
 // ── Historical pass data (last 48 h) ─────────────────────────────────────────
 app.get('/api/history', async (_req: Request, res: Response) => {
+  if (!supabase) { res.json([]); return; }
   try {
     const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const { data, error } = await supabase
