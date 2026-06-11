@@ -255,7 +255,10 @@ app.get('/api/history', async (_req, res) => {
 });
 
 // ── Anthropic client ─────────────────────────────────────────────────────────
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({
+  apiKey:  process.env.ANTHROPIC_API_KEY,
+  timeout: 20_000, // fail fast so SSE error frame reaches the client
+});
 
 // ── /api/chat — SSE streaming chat endpoint ───────────────────────────────────
 app.post('/api/chat', async (req: Request, res: Response) => {
