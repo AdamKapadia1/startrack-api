@@ -244,6 +244,8 @@ app.post('/api/chat', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering on Railway
+    res.flushHeaders();
     let closed = false;
     req.on('close', () => { closed = true; });
     try {
@@ -293,14 +295,11 @@ Answer the user's question conversationally and precisely. Use the real data abo
                 { role: 'user', content: message },
             ],
         });
-        for await (const event of stream) {
-            if (closed)
-                break;
-            if (event.type === 'content_block_delta' &&
-                event.delta.type === 'text_delta') {
-                res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`);
-            }
-        }
+        stream.on('text', (text) => {
+            if (!closed)
+                res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
+        });
+        await stream.finalMessage();
         if (!closed) {
             res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
         }

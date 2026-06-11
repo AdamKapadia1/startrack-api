@@ -324,15 +324,10 @@ Answer the user's question conversationally and precisely. Use the real data abo
       ],
     });
 
-    for await (const event of stream) {
-      if (closed) break;
-      if (
-        event.type === 'content_block_delta' &&
-        event.delta.type === 'text_delta'
-      ) {
-        res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`);
-      }
-    }
+    stream.on('text', (text: string) => {
+      if (!closed) res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
+    });
+    await stream.finalMessage();
 
     if (!closed) {
       res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
