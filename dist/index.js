@@ -248,15 +248,16 @@ app.post('/api/chat', async (req, res) => {
     res.flushHeaders();
     let closed = false;
     req.on('close', () => { closed = true; });
+    // Cap each context fetch at 8 s so streaming always starts promptly
+    function cap(p, fallback, ms = 8000) {
+        return Promise.race([p, new Promise(resolve => setTimeout(() => resolve(fallback), ms))]);
+    }
     try {
-        const [satResult, weatherResult, passResult] = await Promise.allSettled([
-            getVisibleSatellitesData(DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M),
-            getWeatherData(DEFAULT_LAT, DEFAULT_LON),
-            (0, passAgent_js_1.getPassRecommendation)({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire'),
+        const [satData, weatherData, passData] = await Promise.all([
+            cap(getVisibleSatellitesData(DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M), {}),
+            cap(getWeatherData(DEFAULT_LAT, DEFAULT_LON), {}),
+            cap((0, passAgent_js_1.getPassRecommendation)({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire'), { topPasses: [] }),
         ]);
-        const satData = satResult.status === 'fulfilled' ? satResult.value : {};
-        const weatherData = weatherResult.status === 'fulfilled' ? weatherResult.value : {};
-        const passData = passResult.status === 'fulfilled' ? passResult.value : {};
         const sats = satData.satellites ?? [];
         const passes = passData.topPasses ?? [];
         const satList = sats.slice(0, 10).map((s) => {
