@@ -4,7 +4,7 @@ import { getActiveSatellites } from '../utils/tleCache.js';
 
 const N2YO_KEY  = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
 const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
-const OBS       = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
+const DEFAULT_OBS = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
 const MIN_PASS_EL = 30;
 
 const NTFY_TOPIC = 'startrack-tring-alerts';
@@ -44,6 +44,12 @@ export interface NotificationCheckResult {
   alerts:  NotificationAlert[];
 }
 
+type Obs = { lat: number; lon: number; alt: number };
+
+function obsKey(obs: Obs) {
+  return `${obs.lat.toFixed(4)},${obs.lon.toFixed(4)},${obs.alt}`;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function utcToLocal(utc: number): string {
@@ -65,13 +71,12 @@ function utcToDate(utc: number): string {
 
 function groupPassesByDay(passes: Pass[]): { today: Pass[]; tomorrow: Pass[]; thisWeek: Pass[] } {
   const now = Math.floor(Date.now() / 1000);
-  // Midnight today in London time expressed as UTC seconds (approximate via offset)
-  const londonNow   = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+  const londonNow = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
   londonNow.setHours(0, 0, 0, 0);
-  const todayStart  = Math.floor(londonNow.getTime() / 1000);
-  const tomorrowStart   = todayStart + 86_400;
-  const dayAfterStart   = todayStart + 172_800;
-  const weekEnd         = todayStart + 7 * 86_400;
+  const todayStart    = Math.floor(londonNow.getTime() / 1000);
+  const tomorrowStart = todayStart + 86_400;
+  const dayAfterStart = todayStart + 172_800;
+  const weekEnd       = todayStart + 7 * 86_400;
 
   const future = passes.filter(p => p.startUTC > now);
 
@@ -82,13 +87,13 @@ function groupPassesByDay(passes: Pass[]): { today: Pass[]; tomorrow: Pass[]; th
   };
 }
 
-// ── Pass cache (1-hour TTL) ───────────────────────────────────────────────────
+// ── Pass cache (1-hour TTL, keyed by location) ────────────────────────────────
 
-let _passesCache: { data: Pass[]; fetchedAt: number } | null = null;
+const _passesCacheMap = new Map<string, { data: Pass[]; fetchedAt: number }>();
 const PASSES_TTL_S = 60 * 60;
 
-async function fetchPassesForSat(satid: number, satname: string): Promise<Pass[]> {
-  const url = `${N2YO_BASE}/radiopasses/${satid}/${OBS.lat}/${OBS.lon}/${OBS.alt}/7/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
+async function fetchPassesForSat(satid: number, satname: string, obs: Obs): Promise<Pass[]> {
+  const url = `${N2YO_BASE}/radiopasses/${satid}/${obs.lat}/${obs.lon}/${obs.alt}/7/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
   const { data } = await axios.get(url, { timeout: 30_000 });
   return ((data.passes ?? []) as any[]).map(p => ({
     startUTC: p.startUTC as number,
@@ -102,17 +107,18 @@ async function fetchPassesForSat(satid: number, satname: string): Promise<Pass[]
   }));
 }
 
-async function getAllStarlinkPasses(): Promise<Pass[]> {
+async function getAllStarlinkPasses(obs: Obs = DEFAULT_OBS): Promise<Pass[]> {
+  const key = obsKey(obs);
   const now = Math.floor(Date.now() / 1000);
-  if (_passesCache && (now - _passesCache.fetchedAt) < PASSES_TTL_S) {
-    return _passesCache.data;
+  const cached = _passesCacheMap.get(key);
+  if (cached && (now - cached.fetchedAt) < PASSES_TTL_S) {
+    return cached.data;
   }
 
-  // Fetch latest 50 active Starlink satellites from CelesTrak (cached 6h)
   const activeSats = await getActiveSatellites(50);
 
   const results = await Promise.allSettled(
-    activeSats.map(({ noradId, name }) => fetchPassesForSat(noradId, name))
+    activeSats.map(({ noradId, name }) => fetchPassesForSat(noradId, name, obs))
   );
 
   const allPasses: Pass[] = [];
@@ -121,8 +127,8 @@ async function getAllStarlinkPasses(): Promise<Pass[]> {
   }
 
   const sorted = allPasses.sort((a, b) => b.maxEl - a.maxEl);
-  _passesCache = { data: sorted, fetchedAt: now };
-  console.log(`[passAgent] Cached ${sorted.length} passes across ${activeSats.length} satellites (7-day window)`);
+  _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
+  console.log(`[passAgent] Cached ${sorted.length} passes for ${key} (7-day window)`);
   return sorted;
 }
 
@@ -149,7 +155,7 @@ async function sendNtfy(satname: string, maxEl: number, minutesAway: number): Pr
 // ── Public: alert on imminent high-elevation passes ───────────────────────────
 
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
-  const passes    = await getAllStarlinkPasses();
+  const passes    = await getAllStarlinkPasses(DEFAULT_OBS);
   const now       = Math.floor(Date.now() / 1000);
   const windowEnd = now + 10 * 60;
   const alerts: NotificationAlert[] = [];
@@ -177,24 +183,25 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
 
 // ── Public: AI recommendation over 7-day Starlink passes ─────────────────────
 
-export async function getPassRecommendation(): Promise<PassRecommendation> {
-  const allPasses = await getAllStarlinkPasses();
+export async function getPassRecommendation(
+  obs: Obs = DEFAULT_OBS,
+  locationName = 'Tring, Hertfordshire',
+): Promise<PassRecommendation> {
+  const allPasses = await getAllStarlinkPasses(obs);
   const now       = Math.floor(Date.now() / 1000);
   const future    = allPasses.filter(p => p.startUTC > now);
 
   const { today, tomorrow, thisWeek } = groupPassesByDay(future);
 
-  // topPasses: top 10 by elevation for the existing UI components
   const topPasses = future.slice(0, 10);
 
-  // bestPass: single highest elevation pass in the entire 7-day window
   const bestPass = future.length > 0
     ? future.reduce((best, p) => p.maxEl > best.maxEl ? p : best, future[0])
     : null;
 
   if (!topPasses.length) {
     return {
-      recommendation: 'No Starlink passes found in the next 7 days over Tring. The constellation will return shortly.',
+      recommendation: `No Starlink passes found in the next 7 days over ${locationName}. The constellation will return shortly.`,
       satname:   'Starlink',
       topPasses: [],
       today,
@@ -227,7 +234,7 @@ export async function getPassRecommendation(): Promise<PassRecommendation> {
     messages: [
       {
         role:    'user',
-        content: `You are a satellite connectivity assistant tracking Starlink satellites over Tring, Hertfordshire. Here are the top upcoming passes over the next 7 days:\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2–3 sentence plain-English recommendation. Identify the single best connectivity window of the entire week — name the satellite, date, time, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.).`,
+        content: `You are a satellite connectivity assistant tracking Starlink satellites over ${locationName}. Here are the top upcoming passes over the next 7 days:\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2–3 sentence plain-English recommendation. Identify the single best connectivity window of the entire week — name the satellite, date, time, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.).`,
       },
     ],
   });
