@@ -5,6 +5,7 @@ import cors from 'cors';
 import axios from 'axios';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
 import { getActiveSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
 import { calculateDoppler } from './utils/doppler.js';
@@ -248,6 +249,100 @@ app.get('/api/history', async (_req, res) => {
     if (error) throw new Error(error.message);
     res.json(data ?? []);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Anthropic client ─────────────────────────────────────────────────────────
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── /api/chat — SSE streaming chat endpoint ───────────────────────────────────
+app.post('/api/chat', async (req: Request, res: Response) => {
+  const { message, history = [] } = req.body as {
+    message: string;
+    history: { role: 'user' | 'assistant'; content: string }[];
+  };
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  let closed = false;
+  req.on('close', () => { closed = true; });
+
+  try {
+    const [satResult, weatherResult, passResult] = await Promise.allSettled([
+      getVisibleSatellitesData(DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M),
+      getWeatherData(DEFAULT_LAT, DEFAULT_LON),
+      getPassRecommendation({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire'),
+    ]);
+
+    const satData     = satResult.status     === 'fulfilled' ? satResult.value     as any : {};
+    const weatherData = weatherResult.status === 'fulfilled' ? weatherResult.value as any : {};
+    const passData    = passResult.status    === 'fulfilled' ? passResult.value    as any : {};
+
+    const sats:   any[] = satData.satellites  ?? [];
+    const passes: any[] = passData.topPasses  ?? [];
+
+    const satList = sats.slice(0, 10).map((s: any) => {
+      const d = s.dopplerShiftKHz != null
+        ? `, doppler ${s.dopplerShiftKHz > 0 ? '+' : ''}${(s.dopplerShiftKHz as number).toFixed(1)} kHz`
+        : '';
+      return `  ${s.satname}: el ${s.elevation}°, az ${s.azimuth}°${d}`;
+    }).join('\n');
+
+    const passList = passes.slice(0, 5).map((p: any, i: number) => {
+      const peakDate = new Date(p.maxUTC * 1000);
+      const dateStr  = peakDate.toLocaleString('en-GB', {
+        weekday: 'short', day: 'numeric', month: 'short',
+        hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London',
+      });
+      return `  ${i + 1}. ${p.satname}: peak ${dateStr} BST, ${Math.round(p.maxEl)}° max elevation`;
+    }).join('\n');
+
+    const systemPrompt = `You are StarTrack AI, a satellite connectivity assistant. You have access to real-time data for the observer at Tring, Hertfordshire (51.79°N, 0.66°W, 148m altitude).
+
+Current data as of ${new Date().toUTCString()}:
+- Satellites overhead: ${sats.length} Starlink satellites
+- Best elevation: ${sats[0]?.elevation ?? 0}°
+- Signal score: ${satData.signalScore ?? 0}/100
+- Weather: ${weatherData.description ?? 'unknown'}, ${weatherData.cloudCover ?? 0}% cloud cover, ${weatherData.temp ?? 0}°C
+- Visible satellites:
+${satList || '  (none)'}
+- Upcoming passes (next 7 days):
+${passList || '  (none scheduled)'}
+
+Answer the user's question conversationally and precisely. Use the real data above. Be concise — 2–3 sentences maximum unless a detailed answer is needed. If asked about passes, always include exact times. If asked about signal quality, reference the weather and elevation data.`;
+
+    const stream = anthropic.messages.stream({
+      model:      'claude-sonnet-4-6',
+      max_tokens: 1024,
+      system:     systemPrompt,
+      messages:   [
+        ...history,
+        { role: 'user', content: message },
+      ],
+    });
+
+    for await (const event of stream) {
+      if (closed) break;
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'text_delta'
+      ) {
+        res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`);
+      }
+    }
+
+    if (!closed) {
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    }
+    res.end();
+  } catch (err: any) {
+    console.error('[chat]', err.message);
+    if (!closed) {
+      res.write(`data: ${JSON.stringify({ error: true })}\n\n`);
+      res.end();
+    }
+  }
 });
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
