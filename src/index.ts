@@ -267,8 +267,10 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering on Railway
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+  // Send an SSE comment immediately so Railway/proxies know the stream is live
+  res.write(': connected\n\n');
 
   let closed = false;
   req.on('close', () => { closed = true; });
@@ -318,7 +320,10 @@ ${passList || '  (none scheduled)'}
 
 Answer the user's question conversationally and precisely. Use the real data above. Be concise — 2–3 sentences maximum unless a detailed answer is needed. If asked about passes, always include exact times. If asked about signal quality, reference the weather and elevation data.`;
 
-    const stream = anthropic.messages.stream({
+    if (closed) { res.end(); return; }
+
+    // Use raw streaming API for reliable event iteration
+    const response = await anthropic.messages.create({
       model:      'claude-sonnet-4-6',
       max_tokens: 1024,
       system:     systemPrompt,
@@ -326,12 +331,19 @@ Answer the user's question conversationally and precisely. Use the real data abo
         ...history,
         { role: 'user', content: message },
       ],
+      stream: true,
     });
 
-    stream.on('text', (text: string) => {
-      if (!closed) res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
-    });
-    await stream.finalMessage();
+    for await (const event of response) {
+      if (closed) break;
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'text_delta' &&
+        event.delta.text
+      ) {
+        res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`);
+      }
+    }
 
     if (!closed) {
       res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
