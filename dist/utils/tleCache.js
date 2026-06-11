@@ -57,5 +57,10 @@ function findTleByName(name) {
     if (!_cache)
         return undefined;
     const upper = name.toUpperCase().trim();
-    return _cache.entries.find(e => e.name.toUpperCase().trim() === upper);
+    // Exact match first
+    const exact = _cache.entries.find(e => e.name.toUpperCase().trim() === upper);
+    if (exact)
+        return exact;
+    // Prefix match — CelesTrak appends suffixes like "[DTC]" that N2YO omits
+    return _cache.entries.find(e => e.name.toUpperCase().trim().startsWith(upper));
 }
