@@ -278,6 +278,11 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   let closed = false;
   req.on('close', () => { closed = true; });
 
+  // Heartbeat every 5 s keeps Railway's proxy from dropping the SSE connection
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(': ping\n\n');
+  }, 5_000);
+
   // Cap each context fetch at 8 s so streaming always starts promptly
   function cap<T>(p: Promise<T>, fallback: T, ms = 8_000): Promise<T> {
     return Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
@@ -348,14 +353,16 @@ Answer the user's question conversationally and precisely. Use the real data abo
       }
     }
 
+    clearInterval(heartbeat);
     if (!closed) {
       res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     }
     res.end();
   } catch (err: any) {
+    clearInterval(heartbeat);
     console.error('[chat]', err.message);
     if (!closed) {
-      res.write(`data: ${JSON.stringify({ error: true })}\n\n`);
+      res.write(`data: ${JSON.stringify({ error: true, message: err.message })}\n\n`);
       res.end();
     }
   }
