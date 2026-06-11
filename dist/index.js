@@ -1,39 +1,23 @@
 "use strict";
-// ── Startup diagnostics ──────────────────────────────────────────────────────
-process.on('uncaughtException', (err) => {
-    console.error('FATAL uncaughtException:', err.message);
-    console.error(err.stack);
-    process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-    console.error('FATAL unhandledRejection:', reason);
-    process.exit(1);
-});
-console.log('StarTrack starting — node', process.version, 'platform', process.platform);
-console.log('Loading modules...');
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-console.log('  dotenv...');
 const dotenv_1 = __importDefault(require("dotenv"));
-console.log('  express...');
 const express_1 = __importDefault(require("express"));
-console.log('  cors...');
 const cors_1 = __importDefault(require("cors"));
-console.log('  axios...');
 const axios_1 = __importDefault(require("axios"));
-console.log('  @supabase/supabase-js...');
 const supabase_js_1 = require("@supabase/supabase-js");
-console.log('  passAgent...');
 const passAgent_js_1 = require("./agents/passAgent.js");
-console.log('All modules loaded.');
+const tleCache_js_1 = require("./utils/tleCache.js");
+const doppler_js_1 = require("./utils/doppler.js");
+const signalModel_js_1 = require("./utils/signalModel.js");
 dotenv_1.default.config();
 const OBS_LAT = 51.7957;
 const OBS_LON = -0.6572;
 const OBS_ALT_KM = 0.148;
 const R_EARTH_KM = 6371.0;
-// ── Supabase client (null-safe — won't crash if env vars are missing) ────────
+// ── Supabase client (null-safe) ──────────────────────────────────────────────
 const _supabaseUrl = process.env.SUPABASE_URL ?? '';
 const _supabaseKey = process.env.SUPABASE_ANON_KEY ?? '';
 const supabase = _supabaseUrl && _supabaseKey
@@ -64,13 +48,6 @@ function lookAngles(obsLat, obsLon, obsAltKm, satLat, satLon, satAltKm) {
     const azimuth = (toDeg(Math.atan2(east, -south)) + 360) % 360;
     return { elevation, azimuth, range };
 }
-function signalScore(satellites) {
-    if (!satellites.length)
-        return 0;
-    const best = Math.max(...satellites.map(s => s.elevation));
-    const avg = satellites.reduce((s, x) => s + x.elevation, 0) / satellites.length;
-    return Math.min(100, Math.round(satellites.length * 6 + avg * 0.4 + (best > 60 ? 15 : best > 30 ? 8 : 0)));
-}
 // ── In-memory caches ─────────────────────────────────────────────────────────
 let _visibleCache = null;
 const VISIBLE_TTL_S = 5 * 60;
@@ -83,6 +60,17 @@ app.use(express_1.default.json());
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
+});
+// ── TLE status ───────────────────────────────────────────────────────────────
+app.get('/api/tles/status', async (_req, res) => {
+    try {
+        // Ensure cache is populated (triggers fetch if stale/empty)
+        await (0, tleCache_js_1.getActiveSatellites)(50);
+        res.json((0, tleCache_js_1.getTleStatus)());
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 // ── Visible satellites (Starlink cat 52 + OneWeb cat 53) ─────────────────────
 app.get('/api/satellites/visible', async (_req, res) => {
@@ -103,38 +91,61 @@ app.get('/api/satellites/visible', async (_req, res) => {
             if (r.status === 'fulfilled')
                 rawSats.push(...(r.value.data.above ?? []));
         }
+        // Get current weather for signal scoring (use stale cache if available)
+        const weather = _weatherCache?.payload ?? null;
+        const cloudCover = weather?.cloudCover ?? 50;
+        const windSpeed = weather?.windSpeed ?? 5;
+        const visibility = weather?.visibility ?? 10000;
         const seen = new Set();
         const satellites = rawSats
             .filter(sat => { if (seen.has(sat.satname))
             return false; seen.add(sat.satname); return true; })
             .map(sat => {
             const { elevation, azimuth, range } = lookAngles(OBS_LAT, OBS_LON, OBS_ALT_KM, sat.satlat, sat.satlng, sat.satalt);
+            // Doppler — look up TLE by name (Starlink only; OneWeb returns null)
+            const tle = (0, tleCache_js_1.findTleByName)(sat.satname);
+            const doppler = tle
+                ? (0, doppler_js_1.calculateDoppler)(OBS_LAT, OBS_LON, OBS_ALT_KM, tle.line1, tle.line2)
+                : null;
             return {
                 satname: sat.satname,
                 elevation: Math.round(elevation * 10) / 10,
                 azimuth: Math.round(azimuth * 10) / 10,
                 range: Math.round(range),
+                dopplerShiftHz: doppler?.dopplerShiftHz ?? null,
+                dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
             };
         })
             .sort((a, b) => b.elevation - a.elevation);
+        // Enhanced signal score using best satellite + weather
+        const bestSat = satellites[0] ?? null;
+        const signalResult = bestSat
+            ? (0, signalModel_js_1.scoreSignal)({
+                elevation: bestSat.elevation,
+                cloudCover,
+                windSpeed,
+                visibility,
+                range: bestSat.range,
+            })
+            : { total: 0, breakdown: { elevation: 0, cloud: 0, visibility: 0, wind: 0, range: 0 } };
         const payload = {
             location: { name: 'Tring, Hertfordshire', lat: OBS_LAT, lon: OBS_LON },
             count: satellites.length,
             satellites,
+            signalScore: signalResult.total,
+            scoreBreakdown: signalResult.breakdown,
         };
         _visibleCache = { payload, fetchedAt: now };
         res.json(payload);
-        // Fire-and-forget: log snapshot to Supabase for historical charting.
+        // Fire-and-forget Supabase snapshot
         if (supabase) {
-            const maxEl = satellites.length ? Math.max(...satellites.map(s => s.elevation)) : 0;
-            const score = signalScore(satellites);
             supabase.from('pass_predictions').insert({
                 norad_id: 0,
                 user_lat: OBS_LAT,
                 user_lon: OBS_LON,
                 aos_time: new Date().toISOString(),
-                max_elevation: maxEl,
-                signal_score: score,
+                max_elevation: bestSat?.elevation ?? 0,
+                signal_score: signalResult.total,
                 computed_at: new Date().toISOString(),
             }).then(({ error }) => {
                 if (error)
@@ -172,7 +183,7 @@ app.get('/api/weather', async (_req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// ── AI recommendation ────────────────────────────────────────────────────────
+// ── AI recommendation (7-day grouped) ────────────────────────────────────────
 app.get('/api/recommendation', async (_req, res) => {
     try {
         const result = await (0, passAgent_js_1.getPassRecommendation)();
@@ -198,7 +209,7 @@ app.get('/api/notifications/subscribe', (_req, res) => {
         topic: 'startrack-tring-alerts',
         url: passAgent_js_1.NTFY_SUBSCRIBE_URL,
         webUrl: `${passAgent_js_1.NTFY_SUBSCRIBE_URL}/`,
-        instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts. Or open the web URL in any browser.',
+        instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts.',
     });
 });
 // ── Historical pass data (last 48 h) ─────────────────────────────────────────
@@ -226,6 +237,9 @@ app.get('/api/history', async (_req, res) => {
 const PORT = process.env.PORT ?? 3001;
 app.listen(PORT, () => {
     console.log(`StarTrack API listening on port ${PORT}`);
+    // Pre-warm TLE cache on startup
+    (0, tleCache_js_1.getActiveSatellites)(50).catch(err => console.error('[startup] TLE pre-warm failed:', err.message));
+    // Check and notify every 60 s
     setInterval(async () => {
         try {
             const { alerted } = await (0, passAgent_js_1.checkAndNotify)();

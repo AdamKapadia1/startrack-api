@@ -4,6 +4,9 @@ import cors from 'cors';
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
+import { getActiveSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
+import { calculateDoppler } from './utils/doppler.js';
+import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 
 dotenv.config();
 
@@ -12,7 +15,7 @@ const OBS_LON    = -0.6572;
 const OBS_ALT_KM = 0.148;
 const R_EARTH_KM = 6371.0;
 
-// ── Supabase client (null-safe — won't crash if env vars are missing) ────────
+// ── Supabase client (null-safe) ──────────────────────────────────────────────
 const _supabaseUrl = process.env.SUPABASE_URL ?? '';
 const _supabaseKey = process.env.SUPABASE_ANON_KEY ?? '';
 const supabase = _supabaseUrl && _supabaseKey
@@ -23,7 +26,10 @@ const supabase = _supabaseUrl && _supabaseKey
 function toRad(deg: number) { return deg * Math.PI / 180; }
 function toDeg(rad: number) { return rad * 180 / Math.PI; }
 
-function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: number, satLon: number, satAltKm: number) {
+function lookAngles(
+  obsLat: number, obsLon: number, obsAltKm: number,
+  satLat: number, satLon: number, satAltKm: number,
+) {
   const latO = toRad(obsLat), lonO = toRad(obsLon);
   const latS = toRad(satLat), lonS = toRad(satLon);
   const rO = R_EARTH_KM + obsAltKm;
@@ -35,29 +41,28 @@ function lookAngles(obsLat: number, obsLon: number, obsAltKm: number, satLat: nu
   const sy = rS * Math.cos(latS) * Math.sin(lonS);
   const sz = rS * Math.sin(latS);
   const dx = sx - ox, dy = sy - oy, dz = sz - oz;
-  const range = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  const sinLat = Math.sin(latO), cosLat = Math.cos(latO);
-  const sinLon = Math.sin(lonO), cosLon = Math.cos(lonO);
-  const south  = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
-  const east   = -sinLon * dx + cosLon * dy;
-  const up     =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
+  const range    = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const sinLat   = Math.sin(latO), cosLat = Math.cos(latO);
+  const sinLon   = Math.sin(lonO), cosLon = Math.cos(lonO);
+  const south    = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
+  const east     = -sinLon * dx + cosLon * dy;
+  const up       =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
   const elevation = toDeg(Math.asin(up / range));
   const azimuth   = (toDeg(Math.atan2(east, -south)) + 360) % 360;
   return { elevation, azimuth, range };
-}
-
-function signalScore(satellites: Array<{ elevation: number }>): number {
-  if (!satellites.length) return 0;
-  const best = Math.max(...satellites.map(s => s.elevation));
-  const avg  = satellites.reduce((s, x) => s + x.elevation, 0) / satellites.length;
-  return Math.min(100, Math.round(satellites.length * 6 + avg * 0.4 + (best > 60 ? 15 : best > 30 ? 8 : 0)));
 }
 
 // ── In-memory caches ─────────────────────────────────────────────────────────
 let _visibleCache: { payload: object; fetchedAt: number } | null = null;
 const VISIBLE_TTL_S = 5 * 60;
 
-let _weatherCache: { payload: object; fetchedAt: number } | null = null;
+let _weatherCache: {
+  payload: {
+    temp: number; description: string; cloudCover: number;
+    windSpeed: number; visibility: number; isGoodForSatellites: boolean;
+  };
+  fetchedAt: number;
+} | null = null;
 const WEATHER_TTL_S = 10 * 60;
 
 // ── Express app ──────────────────────────────────────────────────────────────
@@ -68,6 +73,17 @@ app.use(express.json());
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok' });
+});
+
+// ── TLE status ───────────────────────────────────────────────────────────────
+app.get('/api/tles/status', async (_req: Request, res: Response) => {
+  try {
+    // Ensure cache is populated (triggers fetch if stale/empty)
+    await getActiveSatellites(50);
+    res.json(getTleStatus());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Visible satellites (Starlink cat 52 + OneWeb cat 53) ─────────────────────
@@ -84,8 +100,8 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
 
   try {
     const [starlinkRes, onewebRes] = await Promise.allSettled([
-      axios.get(aboveUrl(52), { timeout: 30000 }),
-      axios.get(aboveUrl(53), { timeout: 30000 }),
+      axios.get(aboveUrl(52), { timeout: 30_000 }),
+      axios.get(aboveUrl(53), { timeout: 30_000 }),
     ]);
 
     const rawSats: any[] = [];
@@ -93,42 +109,70 @@ app.get('/api/satellites/visible', async (_req: Request, res: Response) => {
       if (r.status === 'fulfilled') rawSats.push(...(r.value.data.above ?? []));
     }
 
+    // Get current weather for signal scoring (use stale cache if available)
+    const weather = _weatherCache?.payload ?? null;
+    const cloudCover  = weather?.cloudCover  ?? 50;
+    const windSpeed   = weather?.windSpeed   ?? 5;
+    const visibility  = weather?.visibility  ?? 10_000;
+
     const seen = new Set<string>();
     const satellites = rawSats
       .filter(sat => { if (seen.has(sat.satname)) return false; seen.add(sat.satname); return true; })
       .map(sat => {
         const { elevation, azimuth, range } = lookAngles(
           OBS_LAT, OBS_LON, OBS_ALT_KM,
-          sat.satlat, sat.satlng, sat.satalt
+          sat.satlat, sat.satlng, sat.satalt,
         );
+
+        // Doppler — look up TLE by name (Starlink only; OneWeb returns null)
+        const tle = findTleByName(sat.satname);
+        const doppler = tle
+          ? calculateDoppler(OBS_LAT, OBS_LON, OBS_ALT_KM, tle.line1, tle.line2)
+          : null;
+
         return {
-          satname:   sat.satname,
-          elevation: Math.round(elevation * 10) / 10,
-          azimuth:   Math.round(azimuth * 10) / 10,
-          range:     Math.round(range),
+          satname:          sat.satname,
+          elevation:        Math.round(elevation * 10) / 10,
+          azimuth:          Math.round(azimuth   * 10) / 10,
+          range:            Math.round(range),
+          dopplerShiftHz:   doppler?.dopplerShiftHz  ?? null,
+          dopplerShiftKHz:  doppler?.dopplerShiftKHz ?? null,
         };
       })
       .sort((a, b) => b.elevation - a.elevation);
 
+    // Enhanced signal score using best satellite + weather
+    const bestSat = satellites[0] ?? null;
+    const signalResult = bestSat
+      ? scoreSignal({
+          elevation:  bestSat.elevation,
+          cloudCover,
+          windSpeed,
+          visibility,
+          range:      bestSat.range,
+        })
+      : { total: 0, breakdown: { elevation: 0, cloud: 0, visibility: 0, wind: 0, range: 0 } as ScoreBreakdown };
+
     const payload = {
       location: { name: 'Tring, Hertfordshire', lat: OBS_LAT, lon: OBS_LON },
-      count: satellites.length,
+      count:       satellites.length,
       satellites,
+      signalScore:    signalResult.total,
+      scoreBreakdown: signalResult.breakdown,
     };
+
     _visibleCache = { payload, fetchedAt: now };
     res.json(payload);
 
-    // Fire-and-forget: log snapshot to Supabase for historical charting.
+    // Fire-and-forget Supabase snapshot
     if (supabase) {
-      const maxEl = satellites.length ? Math.max(...satellites.map(s => s.elevation)) : 0;
-      const score = signalScore(satellites);
       supabase.from('pass_predictions').insert({
         norad_id:      0,
         user_lat:      OBS_LAT,
         user_lon:      OBS_LON,
         aos_time:      new Date().toISOString(),
-        max_elevation: maxEl,
-        signal_score:  score,
+        max_elevation: bestSat?.elevation ?? 0,
+        signal_score:  signalResult.total,
         computed_at:   new Date().toISOString(),
       }).then(({ error }) => {
         if (error) console.error('[supabase] insert failed:', error.message);
@@ -151,7 +195,7 @@ app.get('/api/weather', async (_req: Request, res: Response) => {
   try {
     const { data } = await axios.get(
       `https://api.openweathermap.org/data/2.5/weather?lat=${OBS_LAT}&lon=${OBS_LON}&appid=${OWM_KEY}&units=metric`,
-      { timeout: 15000 }
+      { timeout: 15_000 },
     );
 
     const cloudCover = data.clouds?.all ?? 0;
@@ -160,7 +204,7 @@ app.get('/api/weather', async (_req: Request, res: Response) => {
       description:        data.weather?.[0]?.description ?? '',
       cloudCover,
       windSpeed:          Math.round((data.wind?.speed ?? 0) * 10) / 10,
-      visibility:         data.visibility ?? 10000,
+      visibility:         data.visibility ?? 10_000,
       isGoodForSatellites: cloudCover < 50,
     };
     _weatherCache = { payload, fetchedAt: now };
@@ -170,7 +214,7 @@ app.get('/api/weather', async (_req: Request, res: Response) => {
   }
 });
 
-// ── AI recommendation ────────────────────────────────────────────────────────
+// ── AI recommendation (7-day grouped) ────────────────────────────────────────
 app.get('/api/recommendation', async (_req: Request, res: Response) => {
   try {
     const result = await getPassRecommendation();
@@ -196,7 +240,7 @@ app.get('/api/notifications/subscribe', (_req: Request, res: Response) => {
     topic:        'startrack-tring-alerts',
     url:          NTFY_SUBSCRIBE_URL,
     webUrl:       `${NTFY_SUBSCRIBE_URL}/`,
-    instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts. Or open the web URL in any browser.',
+    instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts.',
   });
 });
 
@@ -210,7 +254,6 @@ app.get('/api/history', async (_req: Request, res: Response) => {
       .select('computed_at, signal_score, max_elevation')
       .gte('computed_at', since)
       .order('computed_at', { ascending: true });
-
     if (error) throw new Error(error.message);
     res.json(data ?? []);
   } catch (err: any) {
@@ -223,6 +266,13 @@ const PORT = process.env.PORT ?? 3001;
 
 app.listen(PORT, () => {
   console.log(`StarTrack API listening on port ${PORT}`);
+
+  // Pre-warm TLE cache on startup
+  getActiveSatellites(50).catch(err =>
+    console.error('[startup] TLE pre-warm failed:', err.message)
+  );
+
+  // Check and notify every 60 s
   setInterval(async () => {
     try {
       const { alerted } = await checkAndNotify();
