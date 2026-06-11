@@ -1,14 +1,33 @@
 "use strict";
+// ── Startup diagnostics ──────────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+    console.error('FATAL uncaughtException:', err.message);
+    console.error(err.stack);
+    process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('FATAL unhandledRejection:', reason);
+    process.exit(1);
+});
+console.log('StarTrack starting — node', process.version, 'platform', process.platform);
+console.log('Loading modules...');
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+console.log('  dotenv...');
 const dotenv_1 = __importDefault(require("dotenv"));
+console.log('  express...');
 const express_1 = __importDefault(require("express"));
+console.log('  cors...');
 const cors_1 = __importDefault(require("cors"));
+console.log('  axios...');
 const axios_1 = __importDefault(require("axios"));
+console.log('  @supabase/supabase-js...');
 const supabase_js_1 = require("@supabase/supabase-js");
+console.log('  passAgent...');
 const passAgent_js_1 = require("./agents/passAgent.js");
+console.log('All modules loaded.');
 dotenv_1.default.config();
 const OBS_LAT = 51.7957;
 const OBS_LON = -0.6572;
