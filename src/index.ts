@@ -185,6 +185,7 @@ app.use(express.json());
 app.get('/health', (_req, res) => res.json({
   status: 'ok',
   hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+  version: 'v8-heartbeat',
 }));
 
 app.get('/api/tles/status', async (_req, res) => {
