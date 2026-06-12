@@ -57,6 +57,57 @@ export function getVisibleNow(
   return out.sort((a, b) => b.elevation - a.elevation);
 }
 
+export interface PositionNow {
+  satname:         string;
+  elevation:       number;
+  azimuth:         number;
+  range:           number;
+  dopplerShiftKHz: number | null;
+}
+
+const STARLINK_FREQ_HZ = 10.7e9;
+const SPEED_OF_LIGHT   = 299_792_458;
+
+/** Propagate all TLEs to current moment; return all with elevation > 0°. Uses cached TLEs only. */
+export function getPositionsNow(
+  tles:   TleEntry[],
+  lat:    number,
+  lon:    number,
+  altKm:  number,
+): PositionNow[] {
+  const obs = makeObs(lat, lon, altKm);
+  const t1  = new Date();
+  const t2  = new Date(t1.getTime() + 1000);
+  const out: PositionNow[] = [];
+
+  for (const tle of tles) {
+    try {
+      const satrec = satellite.twoline2satrec(tle.line1, tle.line2);
+      const la1    = getLook(satrec, t1, obs);
+      if (!la1 || la1.el < 0) continue;
+
+      // Range-rate Doppler: (range2 - range1) km/s → Hz shift
+      let dopplerKHz: number | null = null;
+      const la2 = getLook(satrec, t2, obs);
+      if (la2 !== null) {
+        const radialVelocityMs = (la2.range - la1.range) * 1000;
+        const hz = -(STARLINK_FREQ_HZ * radialVelocityMs) / SPEED_OF_LIGHT;
+        dopplerKHz = Math.round(hz / 1000);
+      }
+
+      out.push({
+        satname:         tle.name,
+        elevation:       Math.round(la1.el    * 10) / 10,
+        azimuth:         Math.round(la1.az    * 10) / 10,
+        range:           Math.round(la1.range),
+        dopplerShiftKHz: dopplerKHz,
+      });
+    } catch { /* skip invalid TLE */ }
+  }
+
+  return out.sort((a, b) => b.elevation - a.elevation);
+}
+
 export interface PredictedPass {
   satname: string; startUTC: number; maxUTC: number; endUTC: number;
   maxEl: number; startAz: number; maxAz: number; duration: number;

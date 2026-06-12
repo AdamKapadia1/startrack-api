@@ -8,7 +8,7 @@ import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
-import { getVisibleNow } from './utils/passPredictor.js';
+import { getVisibleNow, getPositionsNow } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 
@@ -368,6 +368,21 @@ async function broadcastSatellites(target?: WebSocket) {
   }
 }
 
+async function broadcastPositions() {
+  if (clients.size === 0) return;
+  const tles = getAllSatellites();
+  if (tles.length === 0) return;
+  try {
+    const positions = getPositionsNow(tles, DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M / 1000);
+    const message   = JSON.stringify({ type: 'positions', satellites: positions, timestamp: Date.now() });
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) client.send(message);
+    }
+  } catch (err: any) {
+    console.error('[ws] positions broadcast failed:', err.message);
+  }
+}
+
 async function broadcastWeather() {
   if (clients.size === 0) return;
   try {
@@ -410,8 +425,11 @@ server.listen(PORT, () => {
     }
   }, 60_000);
 
-  // Broadcast satellites every 10 s
-  setInterval(() => broadcastSatellites(), 10_000);
+  // Broadcast lightweight positions every 5 s (for smooth animation)
+  setInterval(() => broadcastPositions(), 5_000);
+
+  // Broadcast full satellite data every 30 s
+  setInterval(() => broadcastSatellites(), 30_000);
 
   // Broadcast weather every 60 s
   setInterval(broadcastWeather, 60_000);

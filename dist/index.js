@@ -333,6 +333,24 @@ async function broadcastSatellites(target) {
         console.error('[ws] satellite broadcast failed:', err.message);
     }
 }
+async function broadcastPositions() {
+    if (clients.size === 0)
+        return;
+    const tles = (0, tleCache_js_1.getAllSatellites)();
+    if (tles.length === 0)
+        return;
+    try {
+        const positions = (0, passPredictor_js_1.getPositionsNow)(tles, DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M / 1000);
+        const message = JSON.stringify({ type: 'positions', satellites: positions, timestamp: Date.now() });
+        for (const client of clients) {
+            if (client.readyState === ws_1.WebSocket.OPEN)
+                client.send(message);
+        }
+    }
+    catch (err) {
+        console.error('[ws] positions broadcast failed:', err.message);
+    }
+}
 async function broadcastWeather() {
     if (clients.size === 0)
         return;
@@ -372,8 +390,10 @@ server.listen(PORT, () => {
             console.error('[notifications] check failed:', err.message);
         }
     }, 60000);
-    // Broadcast satellites every 10 s
-    setInterval(() => broadcastSatellites(), 10000);
+    // Broadcast lightweight positions every 5 s (for smooth animation)
+    setInterval(() => broadcastPositions(), 5000);
+    // Broadcast full satellite data every 30 s
+    setInterval(() => broadcastSatellites(), 30000);
     // Broadcast weather every 60 s
     setInterval(broadcastWeather, 60000);
 });
