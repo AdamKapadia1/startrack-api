@@ -183,9 +183,19 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
 
 // ── Public: AI recommendation over 7-day Starlink passes ─────────────────────
 
+// Shape shared with index.ts — avoid importing from there to prevent circular deps
+export interface VisibleSatellite {
+  satname:         string;
+  elevation:       number;
+  azimuth:         number;
+  range:           number;
+  dopplerShiftKHz: number | null;
+}
+
 export async function getPassRecommendation(
   obs: Obs = DEFAULT_OBS,
   locationName = 'Tring, Hertfordshire',
+  currentSatellites: VisibleSatellite[] = [],
 ): Promise<PassRecommendation> {
   const allPasses = await getAllStarlinkPasses(obs);
   const now       = Math.floor(Date.now() / 1000);
@@ -200,8 +210,45 @@ export async function getPassRecommendation(
     : null;
 
   if (!topPasses.length) {
+    // N2YO rate-limited or no passes — fall back to currently visible satellites
+    if (currentSatellites.length > 0) {
+      const satList = currentSatellites.slice(0, 5).map(s => {
+        const d = s.dopplerShiftKHz != null
+          ? `, Doppler ${s.dopplerShiftKHz > 0 ? '+' : ''}${s.dopplerShiftKHz.toFixed(1)} kHz`
+          : '';
+        return `${s.satname}: elevation ${s.elevation}°, azimuth ${s.azimuth}°, range ${s.range} km${d}`;
+      }).join('\n');
+
+      const client = new Anthropic();
+      const stream = client.messages.stream({
+        model:    'claude-opus-4-8',
+        max_tokens: 300,
+        thinking:   { type: 'adaptive' },
+        messages: [{
+          role:    'user',
+          content: `You are a satellite connectivity assistant. Scheduled pass data from N2YO is temporarily unavailable (API rate limit). However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2–3 sentences assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data is temporarily unavailable and will refresh within the hour.`,
+        }],
+      });
+
+      const response = await stream.finalMessage();
+      let recommendation = '';
+      for (const block of response.content) {
+        if (block.type === 'text') { recommendation = block.text; break; }
+      }
+
+      return {
+        recommendation,
+        satname:   currentSatellites[0].satname,
+        topPasses: [],
+        today,
+        tomorrow,
+        thisWeek,
+        bestPass:  null,
+      };
+    }
+
     return {
-      recommendation: `No Starlink passes found in the next 7 days over ${locationName}. The constellation will return shortly.`,
+      recommendation: `No Starlink passes found in the next 7 days over ${locationName}. N2YO pass data may be temporarily rate-limited — check back in a few minutes.`,
       satname:   'Starlink',
       topPasses: [],
       today,

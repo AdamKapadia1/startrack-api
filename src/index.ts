@@ -223,8 +223,15 @@ app.get('/api/weather', async (req: Request, res: Response) => {
 app.get('/api/recommendation', async (req: Request, res: Response) => {
   const { lat, lon, altM } = parseObs(req);
   const locationName = (req.query.name as string) ?? 'Tring, Hertfordshire';
-  try { res.json(await getPassRecommendation({ lat, lon, alt: altM }, locationName)); }
-  catch (err: any) { res.status(500).json({ error: err.message }); }
+  try {
+    // Fetch satellite data first so it can serve as fallback when N2YO is rate-limited
+    const satData = await getVisibleSatellitesData(lat, lon, altM, locationName) as any;
+    res.json(await getPassRecommendation(
+      { lat, lon, alt: altM },
+      locationName,
+      satData.satellites ?? [],
+    ));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/notifications/check', async (_req, res) => {
@@ -290,11 +297,19 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   }
 
   try {
-    const [satData, weatherData, passData] = await Promise.all([
+    // Fetch sat + weather in parallel first; sat data feeds the pass fallback
+    const [satData, weatherData] = await Promise.all([
       cap(getVisibleSatellitesData(DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M) as Promise<any>, {}),
       cap(getWeatherData(DEFAULT_LAT, DEFAULT_LON) as Promise<any>, {}),
-      cap(getPassRecommendation({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire') as Promise<any>, { topPasses: [] }),
     ]);
+    const passData = await cap(
+      getPassRecommendation(
+        { lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M },
+        'Tring, Hertfordshire',
+        (satData as any).satellites ?? [],
+      ) as Promise<any>,
+      { topPasses: [] },
+    );
 
     const sats:   any[] = satData.satellites  ?? [];
     const passes: any[] = passData.topPasses  ?? [];
