@@ -69,16 +69,30 @@ function utcToDate(utc: number): string {
   });
 }
 
-function groupPassesByDay(passes: Pass[]): { today: Pass[]; tomorrow: Pass[]; thisWeek: Pass[] } {
-  const now = Math.floor(Date.now() / 1000);
-  const londonNow = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
-  londonNow.setHours(0, 0, 0, 0);
-  const todayStart    = Math.floor(londonNow.getTime() / 1000);
-  const tomorrowStart = todayStart + 86_400;
-  const dayAfterStart = todayStart + 172_800;
-  const weekEnd       = todayStart + 7 * 86_400;
+// Returns Unix seconds for London midnight on today+daysOffset, correctly handling BST/GMT.
+// Uses sv-SE locale (YYYY-MM-DD) to avoid V8's ambiguous MM/DD/YYYY parsing of en-GB strings.
+function londonDayStartSecs(daysOffset = 0): number {
+  const d   = new Date(Date.now() + daysOffset * 86_400_000);
+  const ymd = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Europe/London' }).format(d); // "2026-06-12"
+  const [y, m, day] = ymd.split('-').map(Number);
+  const utcMidnightMs = Date.UTC(y, m - 1, day);
+  // Ask London what hour UTC-midnight appears as (0 = GMT, 1 = BST)
+  const londonHourAtUtcMidnight = parseInt(
+    new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: 'numeric', hourCycle: 'h23' })
+      .format(new Date(utcMidnightMs)),
+  );
+  // London midnight = UTC midnight minus that offset
+  return Math.floor((utcMidnightMs - londonHourAtUtcMidnight * 3_600_000) / 1000);
+}
 
-  const future = passes.filter(p => p.startUTC > now);
+function groupPassesByDay(passes: Pass[]): { today: Pass[]; tomorrow: Pass[]; thisWeek: Pass[] } {
+  const nowSec        = Math.floor(Date.now() / 1000);
+  const todayStart    = londonDayStartSecs(0);
+  const tomorrowStart = londonDayStartSecs(1);
+  const dayAfterStart = londonDayStartSecs(2);
+  const weekEnd       = londonDayStartSecs(7);
+
+  const future = passes.filter(p => p.startUTC > nowSec);
 
   return {
     today:    future.filter(p => p.startUTC >= todayStart    && p.startUTC < tomorrowStart),
@@ -207,6 +221,10 @@ export async function getPassRecommendation(
         return `${s.satname}: elevation ${s.elevation}°, azimuth ${s.azimuth}°, range ${s.range} km${d}`;
       }).join('\n');
 
+      const bstFallbackNow = new Date().toLocaleString('en-GB', {
+        timeZone: 'Europe/London', weekday: 'long', year: 'numeric',
+        month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
       const client = new Anthropic();
       const stream = client.messages.stream({
         model:    'claude-opus-4-8',
@@ -214,7 +232,7 @@ export async function getPassRecommendation(
         thinking:   { type: 'adaptive' },
         messages: [{
           role:    'user',
-          content: `You are a satellite connectivity assistant. Scheduled pass data from N2YO is temporarily unavailable (API rate limit). However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2–3 sentences assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data is temporarily unavailable and will refresh within the hour.`,
+          content: `You are a satellite connectivity assistant. Current date and time in UK (BST): ${bstFallbackNow}\n\nScheduled pass data is temporarily being computed. However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2–3 sentences assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data will be available shortly.`,
         }],
       });
 
@@ -246,18 +264,24 @@ export async function getPassRecommendation(
     };
   }
 
+  const bstNow = new Date().toLocaleString('en-GB', {
+    timeZone: 'Europe/London',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+
   const passDescriptions = topPasses
     .slice(0, 5)
     .map((p, i) => {
       const start = utcToLocal(p.startUTC);
       const peak  = utcToLocal(p.maxUTC);
       const date  = utcToDate(p.startUTC);
-      return `Pass ${i + 1}: ${p.satname}, ${date} at ${start}, peaks ${peak} at ${p.maxEl.toFixed(1)}°, duration ${p.duration}s`;
+      return `Pass ${i + 1}: ${p.satname}, ${date} at ${start} BST, peaks ${peak} BST at ${p.maxEl.toFixed(1)}°, duration ${p.duration}s`;
     })
     .join('\n');
 
   const bestDesc = bestPass
-    ? `Best pass of the week: ${bestPass.satname} on ${utcToDate(bestPass.startUTC)} at ${utcToLocal(bestPass.startUTC)}, peaking at ${bestPass.maxEl.toFixed(1)}°`
+    ? `Best pass of the week: ${bestPass.satname} on ${utcToDate(bestPass.startUTC)} at ${utcToLocal(bestPass.startUTC)} BST, peaking at ${bestPass.maxEl.toFixed(1)}°`
     : '';
 
   const client = new Anthropic();
@@ -269,7 +293,7 @@ export async function getPassRecommendation(
     messages: [
       {
         role:    'user',
-        content: `You are a satellite connectivity assistant tracking Starlink satellites over ${locationName}. Here are the top upcoming passes over the next 7 days:\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2–3 sentence plain-English recommendation. Identify the single best connectivity window of the entire week — name the satellite, date, time, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.).`,
+        content: `You are a satellite connectivity assistant tracking Starlink satellites over ${locationName}.\n\nCurrent date and time in UK (BST): ${bstNow}\n\nHere are the top upcoming passes over the next 7 days (all times in BST/Europe/London):\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2–3 sentence plain-English recommendation. Identify the single best connectivity window of the entire week — name the satellite, date, time in BST, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.). Always refer to dates relative to today.`,
       },
     ],
   });

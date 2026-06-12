@@ -251,19 +251,29 @@ app.post('/api/chat', async (req, res) => {
             });
             return `  ${i + 1}. ${p.satname}: peak ${dateStr} BST, ${Math.round(p.maxEl)}° max elevation`;
         }).join('\n');
+        const now = new Date();
+        const bstDateTime = now.toLocaleString('en-GB', {
+            timeZone: 'Europe/London', dateStyle: 'full', timeStyle: 'short',
+        });
+        const bstDateOnly = now.toLocaleDateString('en-GB', {
+            timeZone: 'Europe/London', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        });
         const systemPrompt = `You are StarTrack AI, a satellite connectivity assistant. You have access to real-time data for the observer at Tring, Hertfordshire (51.79°N, 0.66°W, 148m altitude).
 
-Current data as of ${new Date().toUTCString()}:
+Current date and time in UK (BST): ${bstDateTime}
+Today's date: ${bstDateOnly}
+
+Current data:
 - Satellites overhead: ${sats.length} Starlink satellites
 - Best elevation: ${sats[0]?.elevation ?? 0}°
 - Signal score: ${satData.signalScore ?? 0}/100
 - Weather: ${weatherData.description ?? 'unknown'}, ${weatherData.cloudCover ?? 0}% cloud cover, ${weatherData.temp ?? 0}°C
 - Visible satellites:
 ${satList || '  (none)'}
-- Upcoming passes (next 7 days):
+- Upcoming passes (all times in BST/Europe/London):
 ${passList || '  (none scheduled)'}
 
-Answer the user's question conversationally and precisely. Use the real data above. Be concise — 2–3 sentences maximum unless a detailed answer is needed. If asked about passes, always include exact times. If asked about signal quality, reference the weather and elevation data.`;
+Answer the user's question conversationally and precisely. Use the real data above. Be concise — 2–3 sentences maximum unless a detailed answer is needed. Always refer to dates relative to today (${bstDateOnly}). All pass times are in BST. Never mention a pass that is in the past. If asked about passes, always include exact BST times.`;
         if (closed) {
             res.end();
             return;
