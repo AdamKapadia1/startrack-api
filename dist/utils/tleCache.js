@@ -10,17 +10,34 @@ exports.findTleByName = findTleByName;
 const axios_1 = __importDefault(require("axios"));
 let _cache = null;
 const TTL_S = 6 * 60 * 60;
-const CELESTRAK_URL = 'https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?FILE=starlink&FORMAT=tle';
+// Primary: main Starlink group (~400 KB, fast). Fallback: supplemental (~900 KB).
+const TLE_URLS = [
+    'https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle',
+    'https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?FILE=starlink&FORMAT=tle',
+];
+async function fetchTleText() {
+    for (const url of TLE_URLS) {
+        try {
+            const { data } = await axios_1.default.get(url, {
+                timeout: 60000,
+                headers: { 'User-Agent': 'StarTrack/1.0 (satellite tracker)', Accept: 'text/plain' },
+                responseType: 'text',
+            });
+            if (String(data).includes('1 '))
+                return String(data);
+        }
+        catch (err) {
+            console.warn(`[tleCache] ${url} failed: ${err.message} — trying next`);
+        }
+    }
+    throw new Error('[tleCache] All TLE sources failed');
+}
 async function getActiveSatellites(limit = 50) {
     const now = Math.floor(Date.now() / 1000);
     if (_cache && (now - _cache.fetchedAt) < TTL_S) {
         return _cache.entries.slice(0, limit);
     }
-    const { data } = await axios_1.default.get(CELESTRAK_URL, {
-        timeout: 30000,
-        headers: { 'User-Agent': 'StarTrack/1.0', Accept: 'text/plain' },
-        responseType: 'text',
-    });
+    const data = await fetchTleText();
     const lines = String(data)
         .split('\n')
         .map((l) => l.trim())
