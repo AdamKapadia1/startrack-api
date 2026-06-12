@@ -98,12 +98,15 @@ async function getAllStarlinkPasses(obs: Obs = DEFAULT_OBS): Promise<Pass[]> {
   const cached = _passesCacheMap.get(key);
   if (cached && (now - cached.fetchedAt) < PASSES_TTL_S) return cached.data;
 
-  // Ensure TLE cache is warm, then use all loaded satellites
+  // Ensure TLE cache is warm, then sample evenly for orbital plane diversity
   await getActiveSatellites(1);
-  const tles = getAllSatellites().slice(0, 100);
-  const altKm = obs.alt / 1000;
+  const allTles = getAllSatellites();
+  const stride  = Math.max(1, Math.floor(allTles.length / 200));
+  const tles    = allTles.filter((_, i) => i % stride === 0);
+  const altKm   = obs.alt / 1000;
 
-  const raw: PredictedPass[] = predictPasses(tles, obs.lat, obs.lon, altKm, 7, 60, MIN_PASS_EL);
+  // 2-min step keeps compute time ~10–20 s; cached 6 hours so first-request cost is ok
+  const raw: PredictedPass[] = predictPasses(tles, obs.lat, obs.lon, altKm, 7, 120, MIN_PASS_EL);
 
   // Convert PredictedPass → Pass (shapes are compatible; just assert type)
   const sorted = (raw as Pass[]).sort((a, b) => b.maxEl - a.maxEl);
