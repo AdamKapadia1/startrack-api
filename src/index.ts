@@ -8,7 +8,7 @@ import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
-import { getVisibleNow, getPositionsNow } from './utils/passPredictor.js';
+import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 
@@ -214,6 +214,78 @@ app.get('/api/notifications/subscribe', (_req, res) => {
     webUrl:       `${NTFY_SUBSCRIBE_URL}/`,
     instructions: 'Install the ntfy app (ntfy.sh), tap Subscribe, enter topic: startrack-tring-alerts.',
   });
+});
+
+app.get('/api/satellites/tle', async (req: Request, res: Response) => {
+  const name = (req.query.name as string)?.trim();
+  if (!name) { res.status(400).json({ error: 'name is required' }); return; }
+
+  await getActiveSatellites(1);
+  const tle = findTleByName(name);
+  if (!tle) { res.status(404).json({ error: `TLE not found for "${name}"` }); return; }
+
+  const { line1, line2 } = tle;
+
+  // NORAD ID from line 1 cols 3-7 (0-indexed: 2-7)
+  const noradId = parseInt(line1.substring(2, 7).trim(), 10);
+
+  // Epoch from line 1 cols 19-32 (0-indexed: 18-32)
+  const epochStr  = line1.substring(18, 32).trim();
+  const yr2       = parseInt(epochStr.substring(0, 2), 10);
+  const dayOfYear = parseFloat(epochStr.substring(2));
+  const fullYear  = yr2 >= 57 ? 1900 + yr2 : 2000 + yr2;
+  const epochMs   = Date.UTC(fullYear, 0, 1) + (dayOfYear - 1) * 86_400_000;
+
+  // Line 2 orbital elements
+  const inclination  = parseFloat(line2.substring(8,  16).trim());
+  const raan         = parseFloat(line2.substring(17, 25).trim());
+  const eccentricity = parseFloat('0.' + line2.substring(26, 33).trim());
+  const meanMotion   = parseFloat(line2.substring(52, 63).trim()); // rev/day
+
+  // Derived quantities
+  const period        = 1440 / meanMotion;                                  // minutes
+  const mu            = 398_600.4418;                                        // km³/s²
+  const semiMajorAxis = Math.cbrt(mu * Math.pow((period * 60) / (2 * Math.PI), 2));
+  const meanAltitude  = Math.round(semiMajorAxis - 6_371);
+
+  res.json({
+    name:         tle.name,
+    tle_line1:    line1,
+    tle_line2:    line2,
+    noradId,
+    epoch:        new Date(epochMs).toISOString(),
+    inclination:  parseFloat(inclination.toFixed(4)),
+    raan:         parseFloat(raan.toFixed(4)),
+    eccentricity: parseFloat(eccentricity.toFixed(7)),
+    period:       parseFloat(period.toFixed(2)),
+    meanAltitude,
+  });
+});
+
+app.get('/api/satellites/passes', async (req: Request, res: Response) => {
+  const name = (req.query.name as string)?.trim();
+  if (!name) { res.status(400).json({ error: 'name is required' }); return; }
+
+  const { lat, lon, altM } = parseObs(req);
+  await getActiveSatellites(1);
+  const tle = findTleByName(name);
+  if (!tle) { res.status(404).json({ error: `TLE not found for "${name}"` }); return; }
+
+  const passes = predictPasses([tle], lat, lon, altM / 1000, 7, 60, 10);
+  const result = passes
+    .sort((a, b) => a.startUTC - b.startUTC)
+    .slice(0, 10)
+    .map(p => ({
+      satname:  p.satname,
+      startUTC: p.startUTC,
+      maxUTC:   p.maxUTC,
+      endUTC:   p.endUTC,
+      maxEl:    p.maxEl,
+      duration: p.duration,
+      score:    Math.round(40 + (p.maxEl / 90) * 60),
+    }));
+
+  res.json(result);
 });
 
 app.get('/api/history', async (_req, res) => {
