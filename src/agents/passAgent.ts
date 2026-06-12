@@ -104,13 +104,18 @@ async function getAllStarlinkPasses(obs: Obs = DEFAULT_OBS): Promise<Pass[]> {
   const stride  = Math.max(1, Math.floor(allTles.length / 200));
   const tles    = allTles.filter((_, i) => i % stride === 0);
   const altKm   = obs.alt / 1000;
+  console.log(`[passAgent] TLEs loaded: ${allTles.length}, sampled: ${tles.length} (stride ${stride})`);
 
-  // 2-min step keeps compute time ~10–20 s; cached 6 hours so first-request cost is ok
+  // 2-min step; cached 6 hours so first-request compute cost is acceptable
   const raw: PredictedPass[] = predictPasses(tles, obs.lat, obs.lon, altKm, 7, 120, MIN_PASS_EL);
 
   // Convert PredictedPass → Pass (shapes are compatible; just assert type)
   const sorted = (raw as Pass[]).sort((a, b) => b.maxEl - a.maxEl);
-  _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
+
+  // Only cache non-empty results; if 0 passes found, return without caching so next request retries
+  if (sorted.length > 0) {
+    _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
+  }
   console.log(`[passAgent] SGP4 computed ${sorted.length} passes for ${key} (7-day window, ${tles.length} sats)`);
   return sorted;
 }
