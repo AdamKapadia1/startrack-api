@@ -63,6 +63,10 @@ export function getTleStatus() {
   };
 }
 
+export function getAllSatellites(): TleEntry[] {
+  return _cache?.entries ?? [];
+}
+
 export function findTleByName(name: string): TleEntry | undefined {
   if (!_cache) return undefined;
   const upper = name.toUpperCase().trim();

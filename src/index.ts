@@ -7,7 +7,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
-import { getActiveSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
+import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
+import { getVisibleNow } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 
@@ -16,7 +17,6 @@ dotenv.config();
 const DEFAULT_LAT   = 51.7957;
 const DEFAULT_LON   = -0.6572;
 const DEFAULT_ALT_M = 148;
-const R_EARTH_KM    = 6371.0;
 
 // ── Supabase ──────────────────────────────────────────────────────────────────
 const _supabaseUrl = process.env.SUPABASE_URL ?? '';
@@ -36,37 +36,6 @@ function parseObs(req: Request) {
   return { lat, lon, altM, altKm: altM / 1000 };
 }
 
-// ── Geometry ──────────────────────────────────────────────────────────────────
-function toRad(deg: number) { return deg * Math.PI / 180; }
-function toDeg(rad: number) { return rad * 180 / Math.PI; }
-
-function lookAngles(
-  obsLat: number, obsLon: number, obsAltKm: number,
-  satLat: number, satLon: number, satAltKm: number,
-) {
-  const latO = toRad(obsLat), lonO = toRad(obsLon);
-  const latS = toRad(satLat), lonS = toRad(satLon);
-  const rO = R_EARTH_KM + obsAltKm;
-  const rS = R_EARTH_KM + satAltKm;
-  const ox = rO * Math.cos(latO) * Math.cos(lonO);
-  const oy = rO * Math.cos(latO) * Math.sin(lonO);
-  const oz = rO * Math.sin(latO);
-  const sx = rS * Math.cos(latS) * Math.cos(lonS);
-  const sy = rS * Math.cos(latS) * Math.sin(lonS);
-  const sz = rS * Math.sin(latS);
-  const dx = sx - ox, dy = sy - oy, dz = sz - oz;
-  const range  = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  const sinLat = Math.sin(latO), cosLat = Math.cos(latO);
-  const sinLon = Math.sin(lonO), cosLon = Math.cos(lonO);
-  const south  = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
-  const east   = -sinLon * dx + cosLon * dy;
-  const up     =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
-  return {
-    elevation: toDeg(Math.asin(up / range)),
-    azimuth:   (toDeg(Math.atan2(east, -south)) + 360) % 360,
-    range,
-  };
-}
 
 // ── Caches ────────────────────────────────────────────────────────────────────
 const _visibleCacheMap = new Map<string, { payload: object; fetchedAt: number }>();
@@ -94,19 +63,9 @@ async function getVisibleSatellitesData(
   const cached = _visibleCacheMap.get(cacheKey);
   if (cached && (now - cached.fetchedAt) < VISIBLE_TTL_S) return cached.payload;
 
-  const N2YO_KEY = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
-  const aboveUrl = (cat: number) =>
-    `https://api.n2yo.com/rest/v1/satellite/above/${lat}/${lon}/${altM}/10/${cat}/&apiKey=${N2YO_KEY}`;
-
-  const [starlinkRes, onewebRes] = await Promise.allSettled([
-    axios.get(aboveUrl(52), { timeout: 30_000 }),
-    axios.get(aboveUrl(53), { timeout: 30_000 }),
-  ]);
-
-  const rawSats: any[] = [];
-  for (const r of [starlinkRes, onewebRes]) {
-    if (r.status === 'fulfilled') rawSats.push(...(r.value.data.above ?? []));
-  }
+  // Warm TLE cache then propagate all satellites locally — no N2YO rate limits
+  await getActiveSatellites(1);
+  const tles = getAllSatellites();
 
   const weatherKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
   const weather    = _weatherCacheMap.get(weatherKey)?.payload ?? null;
@@ -114,25 +73,20 @@ async function getVisibleSatellitesData(
   const windSpeed  = weather?.windSpeed  ?? 5;
   const visibility = weather?.visibility ?? 10_000;
 
-  const seen = new Set<string>();
-  const satellites = rawSats
-    .filter(sat => { if (seen.has(sat.satname)) return false; seen.add(sat.satname); return true; })
-    .map(sat => {
-      const { elevation, azimuth, range } = lookAngles(
-        lat, lon, altKm, sat.satlat, sat.satlng, sat.satalt,
-      );
-      const tle     = findTleByName(sat.satname);
-      const doppler = tle ? calculateDoppler(lat, lon, altKm, tle.line1, tle.line2) : null;
-      return {
-        satname:         sat.satname,
-        elevation:       Math.round(elevation * 10) / 10,
-        azimuth:         Math.round(azimuth   * 10) / 10,
-        range:           Math.round(range),
-        dopplerShiftHz:  doppler?.dopplerShiftHz  ?? null,
-        dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
-      };
-    })
-    .sort((a, b) => b.elevation - a.elevation);
+  const visible = getVisibleNow(tles, lat, lon, altKm, 0);
+
+  const satellites = visible.map(sat => {
+    const tle     = findTleByName(sat.satname);
+    const doppler = tle ? calculateDoppler(lat, lon, altKm, tle.line1, tle.line2) : null;
+    return {
+      satname:         sat.satname,
+      elevation:       sat.elevation,
+      azimuth:         sat.azimuth,
+      range:           sat.range,
+      dopplerShiftHz:  doppler?.dopplerShiftHz  ?? null,
+      dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
+    };
+  });
 
   const bestSat      = satellites[0] ?? null;
   const signalResult = bestSat

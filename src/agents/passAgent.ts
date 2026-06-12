@@ -1,9 +1,9 @@
 import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
-import { getActiveSatellites } from '../utils/tleCache.js';
+import { getActiveSatellites, getAllSatellites } from '../utils/tleCache.js';
+import { predictPasses } from '../utils/passPredictor.js';
+import type { PredictedPass } from '../utils/passPredictor.js';
 
-const N2YO_KEY  = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
-const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
 const DEFAULT_OBS = { lat: 51.7957, lon: -0.6572, alt: 148 } as const;
 const MIN_PASS_EL = 30;
 
@@ -87,48 +87,28 @@ function groupPassesByDay(passes: Pass[]): { today: Pass[]; tomorrow: Pass[]; th
   };
 }
 
-// ── Pass cache (1-hour TTL, keyed by location) ────────────────────────────────
+// ── Pass cache (6-hour TTL, keyed by location, computed locally via SGP4) ────
 
 const _passesCacheMap = new Map<string, { data: Pass[]; fetchedAt: number }>();
-const PASSES_TTL_S = 60 * 60;
-
-async function fetchPassesForSat(satid: number, satname: string, obs: Obs): Promise<Pass[]> {
-  const url = `${N2YO_BASE}/radiopasses/${satid}/${obs.lat}/${obs.lon}/${obs.alt}/7/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
-  const { data } = await axios.get(url, { timeout: 30_000 });
-  return ((data.passes ?? []) as any[]).map(p => ({
-    startUTC: p.startUTC as number,
-    maxUTC:   p.maxUTC   as number,
-    endUTC:   p.endUTC   as number,
-    maxEl:    p.maxEl    as number,
-    startAz:  p.startAz  as number,
-    maxAz:    p.maxAz    as number,
-    duration: (p.duration ?? (p.endUTC - p.startUTC)) as number,
-    satname,
-  }));
-}
+const PASSES_TTL_S = 6 * 60 * 60;
 
 async function getAllStarlinkPasses(obs: Obs = DEFAULT_OBS): Promise<Pass[]> {
   const key = obsKey(obs);
   const now = Math.floor(Date.now() / 1000);
   const cached = _passesCacheMap.get(key);
-  if (cached && (now - cached.fetchedAt) < PASSES_TTL_S) {
-    return cached.data;
-  }
+  if (cached && (now - cached.fetchedAt) < PASSES_TTL_S) return cached.data;
 
-  const activeSats = await getActiveSatellites(50);
+  // Ensure TLE cache is warm, then use all loaded satellites
+  await getActiveSatellites(1);
+  const tles = getAllSatellites().slice(0, 100);
+  const altKm = obs.alt / 1000;
 
-  const results = await Promise.allSettled(
-    activeSats.map(({ noradId, name }) => fetchPassesForSat(noradId, name, obs))
-  );
+  const raw: PredictedPass[] = predictPasses(tles, obs.lat, obs.lon, altKm, 7, 60, MIN_PASS_EL);
 
-  const allPasses: Pass[] = [];
-  for (const r of results) {
-    if (r.status === 'fulfilled') allPasses.push(...r.value);
-  }
-
-  const sorted = allPasses.sort((a, b) => b.maxEl - a.maxEl);
+  // Convert PredictedPass → Pass (shapes are compatible; just assert type)
+  const sorted = (raw as Pass[]).sort((a, b) => b.maxEl - a.maxEl);
   _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
-  console.log(`[passAgent] Cached ${sorted.length} passes for ${key} (7-day window)`);
+  console.log(`[passAgent] SGP4 computed ${sorted.length} passes for ${key} (7-day window, ${tles.length} sats)`);
   return sorted;
 }
 
