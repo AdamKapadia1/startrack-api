@@ -9,8 +9,7 @@ exports.getPassRecommendation = getPassRecommendation;
 const axios_1 = __importDefault(require("axios"));
 const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const tleCache_js_1 = require("../utils/tleCache.js");
-const N2YO_KEY = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
-const N2YO_BASE = 'https://api.n2yo.com/rest/v1/satellite';
+const passPredictor_js_1 = require("../utils/passPredictor.js");
 const DEFAULT_OBS = { lat: 51.7957, lon: -0.6572, alt: 148 };
 const MIN_PASS_EL = 30;
 const NTFY_TOPIC = 'startrack-tring-alerts';
@@ -49,40 +48,31 @@ function groupPassesByDay(passes) {
         thisWeek: future.filter(p => p.startUTC >= dayAfterStart && p.startUTC < weekEnd),
     };
 }
-// ── Pass cache (1-hour TTL, keyed by location) ────────────────────────────────
+// ── Pass cache (6-hour TTL, keyed by location, computed locally via SGP4) ────
 const _passesCacheMap = new Map();
-const PASSES_TTL_S = 60 * 60;
-async function fetchPassesForSat(satid, satname, obs) {
-    const url = `${N2YO_BASE}/radiopasses/${satid}/${obs.lat}/${obs.lon}/${obs.alt}/7/${MIN_PASS_EL}/&apiKey=${N2YO_KEY}`;
-    const { data } = await axios_1.default.get(url, { timeout: 30000 });
-    return (data.passes ?? []).map(p => ({
-        startUTC: p.startUTC,
-        maxUTC: p.maxUTC,
-        endUTC: p.endUTC,
-        maxEl: p.maxEl,
-        startAz: p.startAz,
-        maxAz: p.maxAz,
-        duration: (p.duration ?? (p.endUTC - p.startUTC)),
-        satname,
-    }));
-}
+const PASSES_TTL_S = 6 * 60 * 60;
 async function getAllStarlinkPasses(obs = DEFAULT_OBS) {
     const key = obsKey(obs);
     const now = Math.floor(Date.now() / 1000);
     const cached = _passesCacheMap.get(key);
-    if (cached && (now - cached.fetchedAt) < PASSES_TTL_S) {
+    if (cached && (now - cached.fetchedAt) < PASSES_TTL_S)
         return cached.data;
+    // Ensure TLE cache is warm, then sample evenly for orbital plane diversity
+    await (0, tleCache_js_1.getActiveSatellites)(1);
+    const allTles = (0, tleCache_js_1.getAllSatellites)();
+    const stride = Math.max(1, Math.floor(allTles.length / 200));
+    const tles = allTles.filter((_, i) => i % stride === 0);
+    const altKm = obs.alt / 1000;
+    console.log(`[passAgent] TLEs loaded: ${allTles.length}, sampled: ${tles.length} (stride ${stride})`);
+    // 2-min step; cached 6 hours so first-request compute cost is acceptable
+    const raw = (0, passPredictor_js_1.predictPasses)(tles, obs.lat, obs.lon, altKm, 7, 120, MIN_PASS_EL);
+    // Convert PredictedPass → Pass (shapes are compatible; just assert type)
+    const sorted = raw.sort((a, b) => b.maxEl - a.maxEl);
+    // Only cache non-empty results; if 0 passes found, return without caching so next request retries
+    if (sorted.length > 0) {
+        _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
     }
-    const activeSats = await (0, tleCache_js_1.getActiveSatellites)(50);
-    const results = await Promise.allSettled(activeSats.map(({ noradId, name }) => fetchPassesForSat(noradId, name, obs)));
-    const allPasses = [];
-    for (const r of results) {
-        if (r.status === 'fulfilled')
-            allPasses.push(...r.value);
-    }
-    const sorted = allPasses.sort((a, b) => b.maxEl - a.maxEl);
-    _passesCacheMap.set(key, { data: sorted, fetchedAt: now });
-    console.log(`[passAgent] Cached ${sorted.length} passes for ${key} (7-day window)`);
+    console.log(`[passAgent] SGP4 computed ${sorted.length} passes for ${key} (7-day window, ${tles.length} sats)`);
     return sorted;
 }
 // ── ntfy.sh push notification ─────────────────────────────────────────────────
@@ -122,8 +112,7 @@ async function checkAndNotify() {
     }
     return { checked: passes.length, alerted: alerts.length, alerts };
 }
-// ── Public: AI recommendation over 7-day Starlink passes ─────────────────────
-async function getPassRecommendation(obs = DEFAULT_OBS, locationName = 'Tring, Hertfordshire') {
+async function getPassRecommendation(obs = DEFAULT_OBS, locationName = 'Tring, Hertfordshire', currentSatellites = []) {
     const allPasses = await getAllStarlinkPasses(obs);
     const now = Math.floor(Date.now() / 1000);
     const future = allPasses.filter(p => p.startUTC > now);
@@ -133,8 +122,44 @@ async function getPassRecommendation(obs = DEFAULT_OBS, locationName = 'Tring, H
         ? future.reduce((best, p) => p.maxEl > best.maxEl ? p : best, future[0])
         : null;
     if (!topPasses.length) {
+        // N2YO rate-limited or no passes — fall back to currently visible satellites
+        if (currentSatellites.length > 0) {
+            const satList = currentSatellites.slice(0, 5).map(s => {
+                const d = s.dopplerShiftKHz != null
+                    ? `, Doppler ${s.dopplerShiftKHz > 0 ? '+' : ''}${s.dopplerShiftKHz.toFixed(1)} kHz`
+                    : '';
+                return `${s.satname}: elevation ${s.elevation}°, azimuth ${s.azimuth}°, range ${s.range} km${d}`;
+            }).join('\n');
+            const client = new sdk_1.default();
+            const stream = client.messages.stream({
+                model: 'claude-opus-4-8',
+                max_tokens: 300,
+                thinking: { type: 'adaptive' },
+                messages: [{
+                        role: 'user',
+                        content: `You are a satellite connectivity assistant. Scheduled pass data from N2YO is temporarily unavailable (API rate limit). However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2–3 sentences assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data is temporarily unavailable and will refresh within the hour.`,
+                    }],
+            });
+            const response = await stream.finalMessage();
+            let recommendation = '';
+            for (const block of response.content) {
+                if (block.type === 'text') {
+                    recommendation = block.text;
+                    break;
+                }
+            }
+            return {
+                recommendation,
+                satname: currentSatellites[0].satname,
+                topPasses: [],
+                today,
+                tomorrow,
+                thisWeek,
+                bestPass: null,
+            };
+        }
         return {
-            recommendation: `No Starlink passes found in the next 7 days over ${locationName}. The constellation will return shortly.`,
+            recommendation: `No Starlink passes found in the next 7 days over ${locationName}. N2YO pass data may be temporarily rate-limited — check back in a few minutes.`,
             satname: 'Starlink',
             topPasses: [],
             today,

@@ -13,13 +13,13 @@ const supabase_js_1 = require("@supabase/supabase-js");
 const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const passAgent_js_1 = require("./agents/passAgent.js");
 const tleCache_js_1 = require("./utils/tleCache.js");
+const passPredictor_js_1 = require("./utils/passPredictor.js");
 const doppler_js_1 = require("./utils/doppler.js");
 const signalModel_js_1 = require("./utils/signalModel.js");
 dotenv_1.default.config();
 const DEFAULT_LAT = 51.7957;
 const DEFAULT_LON = -0.6572;
 const DEFAULT_ALT_M = 148;
-const R_EARTH_KM = 6371.0;
 // ── Supabase ──────────────────────────────────────────────────────────────────
 const _supabaseUrl = process.env.SUPABASE_URL ?? '';
 const _supabaseKey = process.env.SUPABASE_ANON_KEY ?? '';
@@ -36,33 +36,6 @@ function parseObs(req) {
     const altM = isNaN(qAlt) ? DEFAULT_ALT_M : qAlt;
     return { lat, lon, altM, altKm: altM / 1000 };
 }
-// ── Geometry ──────────────────────────────────────────────────────────────────
-function toRad(deg) { return deg * Math.PI / 180; }
-function toDeg(rad) { return rad * 180 / Math.PI; }
-function lookAngles(obsLat, obsLon, obsAltKm, satLat, satLon, satAltKm) {
-    const latO = toRad(obsLat), lonO = toRad(obsLon);
-    const latS = toRad(satLat), lonS = toRad(satLon);
-    const rO = R_EARTH_KM + obsAltKm;
-    const rS = R_EARTH_KM + satAltKm;
-    const ox = rO * Math.cos(latO) * Math.cos(lonO);
-    const oy = rO * Math.cos(latO) * Math.sin(lonO);
-    const oz = rO * Math.sin(latO);
-    const sx = rS * Math.cos(latS) * Math.cos(lonS);
-    const sy = rS * Math.cos(latS) * Math.sin(lonS);
-    const sz = rS * Math.sin(latS);
-    const dx = sx - ox, dy = sy - oy, dz = sz - oz;
-    const range = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const sinLat = Math.sin(latO), cosLat = Math.cos(latO);
-    const sinLon = Math.sin(lonO), cosLon = Math.cos(lonO);
-    const south = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
-    const east = -sinLon * dx + cosLon * dy;
-    const up = cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
-    return {
-        elevation: toDeg(Math.asin(up / range)),
-        azimuth: (toDeg(Math.atan2(east, -south)) + 360) % 360,
-        range,
-    };
-}
 // ── Caches ────────────────────────────────────────────────────────────────────
 const _visibleCacheMap = new Map();
 const VISIBLE_TTL_S = 5 * 60;
@@ -76,40 +49,27 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
     const cached = _visibleCacheMap.get(cacheKey);
     if (cached && (now - cached.fetchedAt) < VISIBLE_TTL_S)
         return cached.payload;
-    const N2YO_KEY = process.env.N2YO_API_KEY ?? 'GMVRQ4-MY5LN2-UZUBTB-5RSS';
-    const aboveUrl = (cat) => `https://api.n2yo.com/rest/v1/satellite/above/${lat}/${lon}/${altM}/10/${cat}/&apiKey=${N2YO_KEY}`;
-    const [starlinkRes, onewebRes] = await Promise.allSettled([
-        axios_1.default.get(aboveUrl(52), { timeout: 30000 }),
-        axios_1.default.get(aboveUrl(53), { timeout: 30000 }),
-    ]);
-    const rawSats = [];
-    for (const r of [starlinkRes, onewebRes]) {
-        if (r.status === 'fulfilled')
-            rawSats.push(...(r.value.data.above ?? []));
-    }
+    // Warm TLE cache then propagate all satellites locally — no N2YO rate limits
+    await (0, tleCache_js_1.getActiveSatellites)(1);
+    const tles = (0, tleCache_js_1.getAllSatellites)();
     const weatherKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
     const weather = _weatherCacheMap.get(weatherKey)?.payload ?? null;
     const cloudCover = weather?.cloudCover ?? 50;
     const windSpeed = weather?.windSpeed ?? 5;
     const visibility = weather?.visibility ?? 10000;
-    const seen = new Set();
-    const satellites = rawSats
-        .filter(sat => { if (seen.has(sat.satname))
-        return false; seen.add(sat.satname); return true; })
-        .map(sat => {
-        const { elevation, azimuth, range } = lookAngles(lat, lon, altKm, sat.satlat, sat.satlng, sat.satalt);
+    const visible = (0, passPredictor_js_1.getVisibleNow)(tles, lat, lon, altKm, 0);
+    const satellites = visible.map(sat => {
         const tle = (0, tleCache_js_1.findTleByName)(sat.satname);
         const doppler = tle ? (0, doppler_js_1.calculateDoppler)(lat, lon, altKm, tle.line1, tle.line2) : null;
         return {
             satname: sat.satname,
-            elevation: Math.round(elevation * 10) / 10,
-            azimuth: Math.round(azimuth * 10) / 10,
-            range: Math.round(range),
+            elevation: sat.elevation,
+            azimuth: sat.azimuth,
+            range: sat.range,
             dopplerShiftHz: doppler?.dopplerShiftHz ?? null,
             dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
         };
-    })
-        .sort((a, b) => b.elevation - a.elevation);
+    });
     const bestSat = satellites[0] ?? null;
     const signalResult = bestSat
         ? (0, signalModel_js_1.scoreSignal)({ elevation: bestSat.elevation, cloudCover, windSpeed, visibility, range: bestSat.range })
@@ -198,7 +158,9 @@ app.get('/api/recommendation', async (req, res) => {
     const { lat, lon, altM } = parseObs(req);
     const locationName = req.query.name ?? 'Tring, Hertfordshire';
     try {
-        res.json(await (0, passAgent_js_1.getPassRecommendation)({ lat, lon, alt: altM }, locationName));
+        // Fetch satellite data first so it can serve as fallback when N2YO is rate-limited
+        const satData = await getVisibleSatellitesData(lat, lon, altM, locationName);
+        res.json(await (0, passAgent_js_1.getPassRecommendation)({ lat, lon, alt: altM }, locationName, satData.satellites ?? []));
     }
     catch (err) {
         res.status(500).json({ error: err.message });
@@ -267,11 +229,12 @@ app.post('/api/chat', async (req, res) => {
         return Promise.race([p, new Promise(resolve => setTimeout(() => resolve(fallback), ms))]);
     }
     try {
-        const [satData, weatherData, passData] = await Promise.all([
+        // Fetch sat + weather in parallel first; sat data feeds the pass fallback
+        const [satData, weatherData] = await Promise.all([
             cap(getVisibleSatellitesData(DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M), {}),
             cap(getWeatherData(DEFAULT_LAT, DEFAULT_LON), {}),
-            cap((0, passAgent_js_1.getPassRecommendation)({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire'), { topPasses: [] }),
         ]);
+        const passData = await cap((0, passAgent_js_1.getPassRecommendation)({ lat: DEFAULT_LAT, lon: DEFAULT_LON, alt: DEFAULT_ALT_M }, 'Tring, Hertfordshire', satData.satellites ?? []), { topPasses: [] });
         const sats = satData.satellites ?? [];
         const passes = passData.topPasses ?? [];
         const satList = sats.slice(0, 10).map((s) => {

@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getActiveSatellites = getActiveSatellites;
 exports.getTleStatus = getTleStatus;
+exports.getAllSatellites = getAllSatellites;
 exports.findTleByName = findTleByName;
 const axios_1 = __importDefault(require("axios"));
 let _cache = null;
@@ -52,6 +53,9 @@ function getTleStatus() {
         sampleSatellites: _cache.entries.slice(0, 5).map(e => e.name),
         cacheAgeMinutes: Math.round((now - _cache.fetchedAt) / 60),
     };
+}
+function getAllSatellites() {
+    return _cache?.entries ?? [];
 }
 function findTleByName(name) {
     if (!_cache)
