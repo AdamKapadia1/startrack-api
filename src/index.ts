@@ -519,4 +519,18 @@ server.listen(PORT, () => {
 
   // Broadcast weather every 60 s
   setInterval(broadcastWeather, 60_000);
+
+  // Keep Railway awake — ping /health every 4 min so the dyno never sleeps
+  const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : 'https://web-production-98c0d.up.railway.app';
+
+  setInterval(async () => {
+    try {
+      await axios.get(`${BACKEND_URL}/health`, { timeout: 5_000 });
+      console.log('[keep-alive] ping sent');
+    } catch (err: any) {
+      console.warn('[keep-alive] ping failed:', err.message);
+    }
+  }, 4 * 60 * 1_000);
 });
