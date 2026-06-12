@@ -158,7 +158,7 @@ app.get('/api/satellites/visible', async (req: Request, res: Response) => {
     const bestSat = (payload as any).satellites?.[0] ?? null;
     if (supabase && bestSat) {
       supabase.from('pass_predictions').insert({
-        norad_id: 0, user_lat: lat, user_lon: lon,
+        user_lat: lat, user_lon: lon,
         aos_time: new Date().toISOString(),
         max_elevation: bestSat.elevation,
         signal_score: (payload as any).signalScore ?? 0,
