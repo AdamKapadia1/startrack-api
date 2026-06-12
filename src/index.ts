@@ -277,7 +277,7 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   res.write(': connected\n\n');
 
   let closed = false;
-  req.on('close', () => { closed = true; });
+  res.on('close', () => { closed = true; }); // fires when client disconnects
 
   // Heartbeat every 5 s keeps Railway's proxy from dropping the SSE connection
   const heartbeat = setInterval(() => {
