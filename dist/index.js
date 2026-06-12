@@ -72,7 +72,7 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
     });
     const bestSat = satellites[0] ?? null;
     const signalResult = bestSat
-        ? (0, signalModel_js_1.scoreSignal)({ elevation: bestSat.elevation, cloudCover, windSpeed, visibility, range: bestSat.range })
+        ? (0, signalModel_js_1.scoreSignal)({ elevation: bestSat.elevation, cloudCover, windSpeed, visibility, range: bestSat.range, count: satellites.length })
         : { total: 0, breakdown: { elevation: 0, cloud: 0, visibility: 0, wind: 0, range: 0 } };
     const payload = {
         location: { name: locationName, lat, lon },

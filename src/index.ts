@@ -90,7 +90,7 @@ async function getVisibleSatellitesData(
 
   const bestSat      = satellites[0] ?? null;
   const signalResult = bestSat
-    ? scoreSignal({ elevation: bestSat.elevation, cloudCover, windSpeed, visibility, range: bestSat.range })
+    ? scoreSignal({ elevation: bestSat.elevation, cloudCover, windSpeed, visibility, range: bestSat.range, count: satellites.length })
     : { total: 0, breakdown: { elevation: 0, cloud: 0, visibility: 0, wind: 0, range: 0 } as ScoreBreakdown };
 
   const payload = {
