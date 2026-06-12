@@ -174,6 +174,18 @@ app.get('/api/notifications/check', async (_req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+app.get('/api/notifications/settings', (_req, res) => {
+    res.json((0, passAgent_js_1.getAlertConfig)());
+});
+app.post('/api/notifications/settings', (req, res) => {
+    const { minElevation, alertMinutesBefore, enabled } = req.body;
+    const updated = (0, passAgent_js_1.setAlertConfig)({
+        ...(typeof minElevation === 'number' && { minElevation }),
+        ...(typeof alertMinutesBefore === 'number' && { alertMinutesBefore }),
+        ...(typeof enabled === 'boolean' && { enabled }),
+    });
+    res.json(updated);
+});
 app.get('/api/notifications/subscribe', (_req, res) => {
     res.json({
         topic: 'startrack-tring-alerts',

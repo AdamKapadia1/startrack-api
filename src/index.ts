@@ -6,7 +6,7 @@ import axios from 'axios';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
-import { getPassRecommendation, checkAndNotify, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
+import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
@@ -191,6 +191,20 @@ app.get('/api/recommendation', async (req: Request, res: Response) => {
 app.get('/api/notifications/check', async (_req, res) => {
   try { res.json(await checkAndNotify()); }
   catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/notifications/settings', (_req, res) => {
+  res.json(getAlertConfig());
+});
+
+app.post('/api/notifications/settings', (req: Request, res: Response) => {
+  const { minElevation, alertMinutesBefore, enabled } = req.body;
+  const updated = setAlertConfig({
+    ...(typeof minElevation       === 'number'  && { minElevation }),
+    ...(typeof alertMinutesBefore === 'number'  && { alertMinutesBefore }),
+    ...(typeof enabled            === 'boolean' && { enabled }),
+  });
+  res.json(updated);
 });
 
 app.get('/api/notifications/subscribe', (_req, res) => {

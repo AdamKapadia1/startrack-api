@@ -4,16 +4,55 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.NTFY_SUBSCRIBE_URL = void 0;
+exports.setAlertConfig = setAlertConfig;
+exports.getAlertConfig = getAlertConfig;
 exports.checkAndNotify = checkAndNotify;
 exports.getPassRecommendation = getPassRecommendation;
 const axios_1 = __importDefault(require("axios"));
 const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
+const node_fs_1 = __importDefault(require("node:fs"));
+const node_path_1 = __importDefault(require("node:path"));
 const tleCache_js_1 = require("../utils/tleCache.js");
 const passPredictor_js_1 = require("../utils/passPredictor.js");
 const DEFAULT_OBS = { lat: 51.7957, lon: -0.6572, alt: 148 };
 const MIN_PASS_EL = 30;
 const NTFY_TOPIC = 'startrack-tring-alerts';
 const NTFY_URL = `https://ntfy.sh/${NTFY_TOPIC}`;
+const APP_URL = 'https://startrackv1-ui.vercel.app';
+const DEFAULT_ALERT_CONFIG = {
+    minElevation: 60,
+    alertMinutesBefore: 10,
+    enabled: true,
+};
+let alertConfig = { ...DEFAULT_ALERT_CONFIG };
+const CONFIG_PATH = node_path_1.default.resolve(process.cwd(), 'data', 'alertSettings.json');
+function loadAlertConfig() {
+    try {
+        const text = node_fs_1.default.readFileSync(CONFIG_PATH, 'utf8');
+        const parsed = JSON.parse(text);
+        alertConfig = { ...DEFAULT_ALERT_CONFIG, ...parsed };
+        console.log('[passAgent] alert config loaded:', alertConfig);
+    }
+    catch { /* use defaults on first run */ }
+}
+function persistAlertConfig() {
+    try {
+        node_fs_1.default.mkdirSync(node_path_1.default.dirname(CONFIG_PATH), { recursive: true });
+        node_fs_1.default.writeFileSync(CONFIG_PATH, JSON.stringify(alertConfig, null, 2), 'utf8');
+    }
+    catch (err) {
+        console.error('[passAgent] failed to persist config:', err.message);
+    }
+}
+loadAlertConfig();
+function setAlertConfig(cfg) {
+    alertConfig = { ...alertConfig, ...cfg };
+    persistAlertConfig();
+    return { ...alertConfig };
+}
+function getAlertConfig() {
+    return { ...alertConfig };
+}
 function obsKey(obs) {
     return `${obs.lat.toFixed(4)},${obs.lon.toFixed(4)},${obs.alt}`;
 }
@@ -87,36 +126,85 @@ async function getAllStarlinkPasses(obs = DEFAULT_OBS) {
     return sorted;
 }
 // ── ntfy.sh push notification ─────────────────────────────────────────────────
-const notifiedPasses = new Set();
-async function sendNtfy(satname, maxEl, minutesAway) {
-    await axios_1.default.post(NTFY_URL, `${satname} passes at ${Math.round(maxEl)}° in ${minutesAway} min — good connectivity window`, {
+function passScore(maxEl) {
+    return Math.round(40 + (maxEl / 90) * 60);
+}
+function qualityLabel(score) {
+    if (score >= 85)
+        return 'Excellent';
+    if (score >= 70)
+        return 'Good';
+    if (score >= 50)
+        return 'Fair';
+    return 'Poor';
+}
+async function sendNtfy(pass, minutesAway) {
+    const score = passScore(pass.maxEl);
+    const quality = qualityLabel(score);
+    const timeStr = utcToLocal(pass.startUTC);
+    const durationM = Math.round((pass.duration ?? 600) / 60);
+    const title = `StarTrack — Pass in ${minutesAway} minute${minutesAway === 1 ? '' : 's'}`;
+    const body = `${pass.satname} reaches ${Math.round(pass.maxEl)}° at ${timeStr} BST. Signal score: ${score}/100. Duration: ~${durationM}m. Quality: ${quality}`;
+    const priority = quality === 'Excellent' ? 'high' : 'default';
+    const tags = quality === 'Excellent' ? 'satellite,starlink' : 'satellite';
+    await axios_1.default.post(NTFY_URL, body, {
         headers: {
-            'Title': 'StarTrack Alert',
-            'Priority': 'high',
-            'Tags': 'satellite',
+            'Title': title,
+            'Priority': priority,
+            'Tags': tags,
+            'Click': APP_URL,
             'Content-Type': 'text/plain',
         },
         timeout: 10000,
     });
 }
+// ── Alert tracking (cleared every 24 h to allow re-alerting) ─────────────────
+const notifiedPasses = new Set();
+setInterval(() => {
+    notifiedPasses.clear();
+    console.log('[notifications] daily alert-tracking sets cleared');
+}, 24 * 60 * 60 * 1000);
 // ── Public: alert on imminent high-elevation passes ───────────────────────────
 async function checkAndNotify() {
+    if (!alertConfig.enabled)
+        return { checked: 0, alerted: 0, alerts: [] };
     const passes = await getAllStarlinkPasses(DEFAULT_OBS);
     const now = Math.floor(Date.now() / 1000);
-    const windowEnd = now + 10 * 60;
+    const windowSecs = alertConfig.alertMinutesBefore * 60;
+    const reminderSecs = 2 * 60;
     const alerts = [];
     for (const pass of passes) {
-        if (pass.maxEl >= 60 &&
-            pass.startUTC > now &&
-            pass.startUTC <= windowEnd &&
-            !notifiedPasses.has(pass.startUTC)) {
-            notifiedPasses.add(pass.startUTC);
-            const minutesAway = Math.max(1, Math.round((pass.startUTC - now) / 60));
+        if (pass.maxEl < alertConfig.minElevation)
+            continue;
+        if (pass.startUTC <= now)
+            continue;
+        const secsAway = pass.startUTC - now;
+        const minutesAway = Math.max(1, Math.round(secsAway / 60));
+        const initKey = `${pass.startUTC}`;
+        const reminderKey = `${pass.startUTC}-r`;
+        // Initial alert
+        if (secsAway <= windowSecs && !notifiedPasses.has(initKey)) {
+            notifiedPasses.add(initKey);
             try {
-                await sendNtfy(pass.satname, pass.maxEl, minutesAway);
+                await sendNtfy(pass, minutesAway);
+                console.log(`[ntfy] initial alert: ${pass.satname} in ${minutesAway}min`);
             }
             catch (err) {
                 console.error('[ntfy] push failed:', err.message);
+            }
+            alerts.push({ satname: pass.satname, maxEl: pass.maxEl, minutesAway, startUTC: pass.startUTC });
+        }
+        // 2-minute reminder (only after initial alert was already sent)
+        if (secsAway <= reminderSecs &&
+            notifiedPasses.has(initKey) &&
+            !notifiedPasses.has(reminderKey)) {
+            notifiedPasses.add(reminderKey);
+            try {
+                await sendNtfy(pass, minutesAway);
+                console.log(`[ntfy] 2-min reminder: ${pass.satname}`);
+            }
+            catch (err) {
+                console.error('[ntfy] reminder push failed:', err.message);
             }
             alerts.push({ satname: pass.satname, maxEl: pass.maxEl, minutesAway, startUTC: pass.startUTC });
         }
