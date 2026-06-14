@@ -6,7 +6,7 @@ import axios from 'axios';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
-import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
+import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL, sendDailyDigest, analyzeHistoricalPatterns } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, setOnTleRefresh } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
@@ -229,6 +229,16 @@ app.post('/api/notifications/settings', (req: Request, res: Response) => {
     ...(typeof enabled            === 'boolean' && { enabled }),
   });
   res.json(updated);
+});
+
+app.get('/api/digest/send-now', async (_req, res) => {
+  try { res.json(await sendDailyDigest()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/insights/patterns', async (_req, res) => {
+  try { res.json(await analyzeHistoricalPatterns()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/notifications/subscribe', (_req, res) => {
@@ -459,6 +469,9 @@ Answer the user's question conversationally and precisely. Use the real data abo
   }
 });
 
+// ── Daily digest state ────────────────────────────────────────────────────────
+let lastDigestDate: string | null = null;
+
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
 const server  = http.createServer(app);
 const wss     = new WebSocketServer({ server });
@@ -562,6 +575,25 @@ server.listen(Number(PORT), '0.0.0.0', () => {
 
   // Broadcast weather every 60 s
   setInterval(broadcastWeather, 60_000);
+
+  // Daily digest at 6:00 AM UK time — check every minute
+  setInterval(async () => {
+    const ukTime  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/London' }));
+    const hours   = ukTime.getHours();
+    const minutes = ukTime.getMinutes();
+    if (hours === 6 && minutes === 0) {
+      const today = ukTime.toDateString();
+      if (lastDigestDate !== today) {
+        lastDigestDate = today;
+        try {
+          await sendDailyDigest();
+          console.log('[digest] sent for', today);
+        } catch (err: any) {
+          console.error('[digest] failed:', err.message);
+        }
+      }
+    }
+  }, 60_000);
 
   // Keep Railway awake — ping /health every 4 min so the dyno never sleeps
   const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN

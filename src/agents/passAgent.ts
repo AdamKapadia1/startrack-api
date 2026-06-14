@@ -2,6 +2,7 @@ import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createClient } from '@supabase/supabase-js';
 import { getActiveSatellites, getAllSatellites } from '../utils/tleCache.js';
 import { predictPasses } from '../utils/passPredictor.js';
 import type { PredictedPass } from '../utils/passPredictor.js';
@@ -416,3 +417,178 @@ export async function getPassRecommendation(
 }
 
 export const NTFY_SUBSCRIBE_URL = NTFY_URL;
+
+// ── Daily digest ──────────────────────────────────────────────────────────────
+
+export interface DigestResult {
+  title:      string;
+  body:       string;
+  passCount:  number;
+  sent:       boolean;
+}
+
+export async function sendDailyDigest(): Promise<DigestResult> {
+  const now    = Math.floor(Date.now() / 1000);
+  const in24h  = now + 24 * 60 * 60;
+
+  const allPasses = await getAllStarlinkPasses(DEFAULT_OBS);
+  const next24h   = allPasses.filter(p => p.startUTC >= now && p.startUTC <= in24h);
+
+  // Try ≥60° first, fall back to ≥40° if fewer than 3 qualify
+  let top = next24h
+    .filter(p => p.maxEl >= 60)
+    .sort((a, b) => passScore(b.maxEl) - passScore(a.maxEl))
+    .slice(0, 3);
+
+  if (top.length < 3) {
+    top = next24h
+      .filter(p => p.maxEl >= 40)
+      .sort((a, b) => passScore(b.maxEl) - passScore(a.maxEl))
+      .slice(0, 3);
+  }
+
+  const dateStr = new Date().toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', timeZone: 'Europe/London',
+  });
+  const title = `☀️ StarTrack Daily Digest — ${dateStr}`;
+
+  const lines = top.map((p, i) => {
+    const quality = qualityLabel(passScore(p.maxEl));
+    return `${i + 1}. ${p.satname} at ${utcToLocal(p.startUTC)} — ${Math.round(p.maxEl)}° (${quality})`;
+  });
+
+  const body = top.length > 0
+    ? `Today's best connectivity windows:\n\n${lines.join('\n')}\n\nPlan your video calls and large transfers around these times.`
+    : "No high-quality passes predicted for today. Signal conditions may be limited.";
+
+  await axios.post(NTFY_URL, body, {
+    headers: {
+      'Title':        title,
+      'Priority':     'default',
+      'Tags':         'sunrise,satellite',
+      'Click':        APP_URL,
+      'Content-Type': 'text/plain',
+    },
+    timeout: 10_000,
+  });
+
+  console.log(`[digest] sent: ${top.length} passes`);
+  return { title, body, passCount: top.length, sent: true };
+}
+
+// ── Historical pattern analysis ───────────────────────────────────────────────
+
+function _getSupabase() {
+  const url = process.env.SUPABASE_URL     ?? '';
+  const key = process.env.SUPABASE_ANON_KEY ?? '';
+  if (!url || !key) return null;
+  return createClient(url, key);
+}
+
+function _fmtHour(h: number): string {
+  if (h === 0)  return '12am';
+  if (h === 12) return '12pm';
+  return h < 12 ? `${h}am` : `${h - 12}pm`;
+}
+
+export interface HourScore { hour: number; avgScore: number; }
+
+export interface PatternAnalysis {
+  available:    boolean;
+  message?:     string;
+  dataPoints?:  number;
+  insight?:     string;
+  bestHours?:   HourScore[];
+  worstHours?:  HourScore[];
+  trend?:       string;
+  hourlyScores?: HourScore[];
+}
+
+export async function analyzeHistoricalPatterns(): Promise<PatternAnalysis> {
+  const supabase = _getSupabase();
+  if (!supabase) return { available: false, message: 'Database not configured.' };
+
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await supabase
+    .from('pass_predictions')
+    .select('computed_at, signal_score, max_elevation')
+    .gte('computed_at', sevenDaysAgo)
+    .order('computed_at', { ascending: true });
+
+  if (error) throw new Error(error.message);
+
+  const rows = (data ?? []).filter(r => typeof r.signal_score === 'number');
+
+  if (rows.length < 50) {
+    return {
+      available:  false,
+      message:    'Not enough historical data yet. Check back after a few more days of tracking.',
+      dataPoints: rows.length,
+    };
+  }
+
+  // Group scores by hour of day in Europe/London timezone
+  const buckets = new Map<number, number[]>();
+  for (const row of rows) {
+    const h = parseInt(
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London', hour: 'numeric', hourCycle: 'h23',
+      }).format(new Date(row.computed_at)),
+      10,
+    );
+    if (!buckets.has(h)) buckets.set(h, []);
+    buckets.get(h)!.push(row.signal_score as number);
+  }
+
+  const hourlyScores: HourScore[] = Array.from({ length: 24 }, (_, h) => {
+    const s = buckets.get(h) ?? [];
+    return {
+      hour:     h,
+      avgScore: s.length > 0 ? Math.round(s.reduce((a, b) => a + b, 0) / s.length) : 0,
+    };
+  });
+
+  const ranked     = [...hourlyScores].filter(x => x.avgScore > 0).sort((a, b) => b.avgScore - a.avgScore);
+  const bestHours  = ranked.slice(0, 3);
+  const worstHours = ranked.slice(-3).reverse();
+
+  // Overall trend: first half vs second half of collected data
+  const half       = Math.floor(rows.length / 2);
+  const avgFirst   = Math.round(rows.slice(0, half).reduce((a, r) => a + r.signal_score, 0) / half);
+  const avgSecond  = Math.round(rows.slice(half).reduce((a, r)  => a + r.signal_score, 0) / (rows.length - half));
+  const diff       = avgSecond - avgFirst;
+  const trendWord  = diff > 3 ? 'improving' : diff < -3 ? 'declining' : 'stable';
+  const trend      = `${trendWord} (${avgFirst} → ${avgSecond})`;
+
+  const bestStr  = bestHours.map(b  => `  ${_fmtHour(b.hour)}: ${b.avgScore}/100`).join('\n');
+  const worstStr = worstHours.map(w => `  ${_fmtHour(w.hour)}: ${w.avgScore}/100`).join('\n');
+
+  const prompt = `Based on 7 days of signal score data for Tring, Hertfordshire:
+
+Best hours (average score):
+${bestStr}
+
+Worst hours (average score):
+${worstStr}
+
+Overall trend: ${trendWord} (first half avg: ${avgFirst}, second half avg: ${avgSecond})
+
+Write a 2-3 sentence insight for the user about when they get the best connectivity, in a friendly, specific tone. Mention actual times. Example style: 'Your best connectivity is consistently between 10pm and 2am, likely due to favourable orbital geometry during those hours. Avoid scheduling important calls between 2pm-4pm when signal tends to be weakest.'`;
+
+  const client = new Anthropic();
+  const stream = client.messages.stream({
+    model:      'claude-opus-4-8',
+    max_tokens: 220,
+    thinking:   { type: 'adaptive' },
+    messages:   [{ role: 'user', content: prompt }],
+  });
+
+  const resp = await stream.finalMessage();
+  let insight = '';
+  for (const block of resp.content) {
+    if (block.type === 'text') { insight = block.text; break; }
+  }
+
+  return { available: true, insight, bestHours, worstHours, trend, hourlyScores };
+}
