@@ -108,11 +108,15 @@ async function getWeatherData(lat, lon) {
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express_1.default.json());
-app.get('/health', (_req, res) => res.json({
-    status: 'ok',
-    hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
-    version: 'v8-heartbeat',
-}));
+app.get('/health', (req, res) => {
+    console.log('[health] headers:', JSON.stringify(req.headers));
+    res.json({
+        status: 'ok',
+        hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+        wsClients: clients.size,
+        version: 'v9-ws-diag',
+    });
+});
 app.get('/api/tles/status', async (_req, res) => {
     try {
         await (0, tleCache_js_1.getActiveSatellites)(50);
@@ -401,6 +405,10 @@ Answer the user's question conversationally and precisely. Use the real data abo
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
 const clients = new Set();
+console.log('[ws] WebSocket server attached to HTTP server');
+wss.on('error', (err) => {
+    console.error('[ws] SERVER ERROR:', err.message);
+});
 async function broadcastSatellites(target) {
     const targets = target ? [target] : Array.from(clients);
     if (targets.length === 0)
@@ -450,11 +458,24 @@ async function broadcastWeather() {
         console.error('[ws] weather broadcast failed:', err.message);
     }
 }
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
     clients.add(ws);
-    console.log(`[ws] client connected — ${clients.size} total`);
-    ws.on('close', () => { clients.delete(ws); console.log(`[ws] client disconnected — ${clients.size} total`); });
-    ws.on('error', () => clients.delete(ws));
+    console.log('[ws] NEW CONNECTION from', req.socket.remoteAddress);
+    console.log('[ws] upgrade headers:', JSON.stringify({
+        host: req.headers['host'],
+        origin: req.headers['origin'],
+        upgrade: req.headers['upgrade'],
+        connection: req.headers['connection'],
+    }));
+    console.log('[ws] total clients now:', clients.size);
+    ws.on('close', (code, reason) => {
+        clients.delete(ws);
+        console.log(`[ws] client disconnected — code: ${code}, reason: ${reason.toString() || '(none)'} — ${clients.size} remaining`);
+    });
+    ws.on('error', (err) => {
+        console.error('[ws] client error:', err.message);
+        clients.delete(ws);
+    });
     // Send current data immediately on connect
     broadcastSatellites(ws);
 });
@@ -480,4 +501,17 @@ server.listen(PORT, () => {
     setInterval(() => broadcastSatellites(), 30000);
     // Broadcast weather every 60 s
     setInterval(broadcastWeather, 60000);
+    // Keep Railway awake — ping /health every 4 min so the dyno never sleeps
+    const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+        : 'https://web-production-98c0d.up.railway.app';
+    setInterval(async () => {
+        try {
+            await axios_1.default.get(`${BACKEND_URL}/health`, { timeout: 5000 });
+            console.log('[keep-alive] ping sent');
+        }
+        catch (err) {
+            console.warn('[keep-alive] ping failed:', err.message);
+        }
+    }, 4 * 60 * 1000);
 });

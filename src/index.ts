@@ -136,11 +136,15 @@ const app = express();
 app.use(cors({ origin: true, methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
-app.get('/health', (_req, res) => res.json({
-  status: 'ok',
-  hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
-  version: 'v8-heartbeat',
-}));
+app.get('/health', (req, res) => {
+  console.log('[health] headers:', JSON.stringify(req.headers));
+  res.json({
+    status: 'ok',
+    hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+    wsClients: clients.size,
+    version: 'v9-ws-diag',
+  });
+});
 
 app.get('/api/tles/status', async (_req, res) => {
   try { await getActiveSatellites(50); res.json(getTleStatus()); }
@@ -436,9 +440,14 @@ Answer the user's question conversationally and precisely. Use the real data abo
 });
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
-const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
+const server  = http.createServer(app);
+const wss     = new WebSocketServer({ server });
 const clients = new Set<WebSocket>();
+console.log('[ws] WebSocket server attached to HTTP server');
+
+wss.on('error', (err) => {
+  console.error('[ws] SERVER ERROR:', err.message);
+});
 
 async function broadcastSatellites(target?: WebSocket) {
   const targets = target ? [target] : Array.from(clients);
@@ -482,11 +491,24 @@ async function broadcastWeather() {
   }
 }
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
   clients.add(ws);
-  console.log(`[ws] client connected — ${clients.size} total`);
-  ws.on('close', () => { clients.delete(ws); console.log(`[ws] client disconnected — ${clients.size} total`); });
-  ws.on('error', () => clients.delete(ws));
+  console.log('[ws] NEW CONNECTION from', req.socket.remoteAddress);
+  console.log('[ws] upgrade headers:', JSON.stringify({
+    host:      req.headers['host'],
+    origin:    req.headers['origin'],
+    upgrade:   req.headers['upgrade'],
+    connection: req.headers['connection'],
+  }));
+  console.log('[ws] total clients now:', clients.size);
+  ws.on('close', (code, reason) => {
+    clients.delete(ws);
+    console.log(`[ws] client disconnected — code: ${code}, reason: ${reason.toString() || '(none)'} — ${clients.size} remaining`);
+  });
+  ws.on('error', (err) => {
+    console.error('[ws] client error:', err.message);
+    clients.delete(ws);
+  });
   // Send current data immediately on connect
   broadcastSatellites(ws);
 });
