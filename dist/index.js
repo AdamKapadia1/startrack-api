@@ -39,6 +39,11 @@ function parseObs(req) {
 // ── Caches ────────────────────────────────────────────────────────────────────
 const _visibleCacheMap = new Map();
 const VISIBLE_TTL_S = 5 * 60;
+// Clear visible cache whenever the TLE cache refreshes (new constellations appear immediately)
+(0, tleCache_js_1.setOnTleRefresh)(() => {
+    _visibleCacheMap.clear();
+    console.log('[tleCache] visible satellite cache cleared — new TLEs will propagate on next request');
+});
 const _weatherCacheMap = new Map();
 const WEATHER_TTL_S = 10 * 60;
 // ── Shared data functions (used by REST endpoints + WS broadcasts) ────────────
@@ -483,7 +488,8 @@ wss.on('connection', (ws, req) => {
 const PORT = process.env.PORT ?? 3001;
 server.listen(PORT, () => {
     console.log(`StarTrack API listening on port ${PORT} (HTTP + WebSocket)`);
-    (0, tleCache_js_1.getActiveSatellites)(50).catch(err => console.error('[startup] TLE pre-warm failed:', err.message));
+    // Fetch all constellations (Starlink + OneWeb + ISS + GPS) on startup
+    (0, tleCache_js_1.getActiveSatellites)(9999).catch(err => console.error('[startup] TLE pre-warm failed:', err.message));
     // Notification check every 60 s
     setInterval(async () => {
         try {

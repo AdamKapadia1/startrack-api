@@ -7,7 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL } from './agents/passAgent.js';
-import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName } from './utils/tleCache.js';
+import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, setOnTleRefresh } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
 import { calculateDoppler } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
@@ -40,6 +40,12 @@ function parseObs(req: Request) {
 // ── Caches ────────────────────────────────────────────────────────────────────
 const _visibleCacheMap = new Map<string, { payload: object; fetchedAt: number }>();
 const VISIBLE_TTL_S = 5 * 60;
+
+// Clear visible cache whenever the TLE cache refreshes (new constellations appear immediately)
+setOnTleRefresh(() => {
+  _visibleCacheMap.clear();
+  console.log('[tleCache] visible satellite cache cleared — new TLEs will propagate on next request');
+});
 
 const _weatherCacheMap = new Map<string, {
   payload: {
@@ -519,7 +525,8 @@ const PORT = process.env.PORT ?? 3001;
 server.listen(PORT, () => {
   console.log(`StarTrack API listening on port ${PORT} (HTTP + WebSocket)`);
 
-  getActiveSatellites(50).catch(err =>
+  // Fetch all constellations (Starlink + OneWeb + ISS + GPS) on startup
+  getActiveSatellites(9999).catch(err =>
     console.error('[startup] TLE pre-warm failed:', err.message),
   );
 

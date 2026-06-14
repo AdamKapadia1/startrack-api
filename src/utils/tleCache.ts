@@ -35,35 +35,39 @@ function seedEntries(): TleEntry[] {
 
 let _cache: TleCache = {
   entries:   seedEntries(),
-  fetchedAt: 0, // age=0 triggers background refresh on first use, but seed is available immediately
+  fetchedAt: 0, // age=0 triggers background refresh on first use
 };
 
 const TTL_S = 6 * 60 * 60;
 
-// Supplemental first — no "GP data not updated" delta-download issue.
-// Main group second as fallback.
-const TLE_URLS = [
-  'https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?FILE=starlink&FORMAT=tle',
-  'https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle',
+// All constellation sources fetched in parallel on every refresh
+const TLE_SOURCES: Array<{ label: string; urls: string[] }> = [
+  {
+    label: 'Starlink',
+    urls: [
+      'https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?FILE=starlink&FORMAT=tle',
+      'https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle',
+    ],
+  },
+  {
+    label: 'OneWeb',
+    urls: [
+      'https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle',
+    ],
+  },
+  {
+    label: 'Stations (ISS)',
+    urls: [
+      'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle',
+    ],
+  },
+  {
+    label: 'GPS',
+    urls: [
+      'https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle',
+    ],
+  },
 ];
-
-async function fetchTleText(): Promise<string> {
-  for (const url of TLE_URLS) {
-    try {
-      const { data } = await axios.get(url, {
-        timeout: 60_000,
-        headers: { 'User-Agent': 'StarTrack/1.0 (satellite tracker)', Accept: 'text/plain' },
-        responseType: 'text',
-      });
-      const text = String(data);
-      if (text.includes('1 ') && text.includes('2 ')) return text;
-      console.warn(`[tleCache] ${url} returned no TLE data (delta-download response?)`);
-    } catch (err: any) {
-      console.warn(`[tleCache] ${url} failed: ${err.message} — trying next`);
-    }
-  }
-  throw new Error('[tleCache] All TLE sources failed');
-}
 
 function parseTleText(text: string): TleEntry[] {
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -78,17 +82,62 @@ function parseTleText(text: string): TleEntry[] {
   return entries;
 }
 
-// Refresh in background without blocking callers
+async function fetchOneSource(label: string, urls: string[]): Promise<TleEntry[]> {
+  for (const url of urls) {
+    try {
+      const { data } = await axios.get(url, {
+        timeout: 30_000,
+        headers: { 'User-Agent': 'StarTrack/1.0 (satellite tracker)', Accept: 'text/plain' },
+        responseType: 'text',
+      });
+      const text = String(data);
+      if (text.includes('1 ') && text.includes('2 ')) {
+        const entries = parseTleText(text);
+        console.log(`[tleCache] ${label}: fetched ${entries.length} TLEs from ${url}`);
+        return entries;
+      }
+      console.warn(`[tleCache] ${label}: ${url} returned no TLE data`);
+    } catch (err: any) {
+      console.warn(`[tleCache] ${label}: ${url} failed: ${err.message}`);
+    }
+  }
+  console.error(`[tleCache] ${label}: all sources failed`);
+  return [];
+}
+
+// Callback so index.ts can clear visible-satellite cache when TLEs refresh
+let _onRefresh: (() => void) | null = null;
+export function setOnTleRefresh(cb: () => void) { _onRefresh = cb; }
+
 let _refreshing = false;
+
 function refreshInBackground() {
   if (_refreshing) return;
   _refreshing = true;
-  fetchTleText()
-    .then(text => {
-      const entries = parseTleText(text);
-      if (entries.length > 0) {
-        _cache = { entries, fetchedAt: Math.floor(Date.now() / 1000) };
-        console.log(`[tleCache] Refreshed: ${entries.length} Starlink satellites`);
+
+  Promise.all(TLE_SOURCES.map(src => fetchOneSource(src.label, src.urls)))
+    .then(results => {
+      // Merge all constellations, deduplicate by NORAD ID
+      const merged: TleEntry[] = [];
+      const seen = new Set<number>();
+      for (const entries of results) {
+        for (const entry of entries) {
+          if (!seen.has(entry.noradId)) {
+            seen.add(entry.noradId);
+            merged.push(entry);
+          }
+        }
+      }
+
+      if (merged.length > 0) {
+        _cache = { entries: merged, fetchedAt: Math.floor(Date.now() / 1000) };
+        const sl  = merged.filter(e => e.name.toUpperCase().includes('STARLINK')).length;
+        const ow  = merged.filter(e => e.name.toUpperCase().includes('ONEWEB')).length;
+        const iss = merged.filter(e => e.name.toUpperCase().includes('ISS') || e.name.toUpperCase().includes('ZARYA')).length;
+        const gps = merged.filter(e => e.name.toUpperCase().includes('GPS') || e.name.toUpperCase().includes('NAVSTAR')).length;
+        console.log(`[tleCache] Refreshed: ${merged.length} total — Starlink: ${sl}, OneWeb: ${ow}, ISS/Stations: ${iss}, GPS: ${gps}`);
+        // Clear visible-satellite cache so next request re-propagates all new TLEs
+        _onRefresh?.();
       }
     })
     .catch(err => console.error('[tleCache] Background refresh failed:', err.message))
@@ -97,18 +146,21 @@ function refreshInBackground() {
 
 export async function getActiveSatellites(limit = 50): Promise<TleEntry[]> {
   const now = Math.floor(Date.now() / 1000);
-  // If cache is stale, trigger background refresh (don't block)
   if (now - _cache.fetchedAt > TTL_S) refreshInBackground();
   return _cache.entries.slice(0, limit);
 }
 
 export function getTleStatus() {
   const now = Math.floor(Date.now() / 1000);
+  const entries = _cache.entries;
   return {
     lastRefreshed:    _cache.fetchedAt > 0 ? new Date(_cache.fetchedAt * 1000).toISOString() : 'seed',
-    satelliteCount:   _cache.entries.length,
+    satelliteCount:   entries.length,
+    starlink:         entries.filter(e => e.name.toUpperCase().includes('STARLINK')).length,
+    oneweb:           entries.filter(e => e.name.toUpperCase().includes('ONEWEB')).length,
+    iss:              entries.filter(e => e.name.toUpperCase().includes('ISS') || e.name.toUpperCase().includes('ZARYA')).length,
+    gps:              entries.filter(e => e.name.toUpperCase().includes('GPS') || e.name.toUpperCase().includes('NAVSTAR')).length,
     nextRefresh:      new Date((_cache.fetchedAt + TTL_S) * 1000).toISOString(),
-    sampleSatellites: _cache.entries.slice(0, 5).map(e => e.name),
     cacheAgeMinutes:  Math.round((now - _cache.fetchedAt) / 60),
   };
 }
