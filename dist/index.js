@@ -119,7 +119,20 @@ app.get('/health', (req, res) => {
         status: 'ok',
         hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
         wsClients: clients.size,
-        version: 'v9-ws-diag',
+        version: 'v10-0.0.0.0',
+    });
+});
+app.get('/api/debug/server-info', (_req, res) => {
+    res.json({
+        port: process.env.PORT ?? 3001,
+        wsClients: clients.size,
+        wssAttached: !!wss,
+        nodeVersion: process.version,
+        uptime: Math.round(process.uptime()),
+        env: {
+            hasPort: !!process.env.PORT,
+            portValue: process.env.PORT ?? '(not set, using 3001)',
+        },
     });
 });
 app.get('/api/tles/status', async (_req, res) => {
@@ -486,8 +499,8 @@ wss.on('connection', (ws, req) => {
 });
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ?? 3001;
-server.listen(PORT, () => {
-    console.log(`StarTrack API listening on port ${PORT} (HTTP + WebSocket)`);
+server.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`StarTrack API listening on 0.0.0.0:${PORT} (HTTP + WebSocket)`);
     // Fetch all constellations (Starlink + OneWeb + ISS + GPS) on startup
     (0, tleCache_js_1.getActiveSatellites)(9999).catch(err => console.error('[startup] TLE pre-warm failed:', err.message));
     // Notification check every 60 s
