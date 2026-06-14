@@ -506,7 +506,16 @@ export interface PatternAnalysis {
 
 export async function analyzeHistoricalPatterns(): Promise<PatternAnalysis> {
   const supabase = _getSupabase();
-  if (!supabase) return { available: false, message: 'Database not configured.' };
+  if (!supabase) {
+    console.warn('[patterns] Supabase not configured — missing env vars');
+    return { available: false, message: 'Database not configured.', dataPoints: 0 };
+  }
+
+  // Log total row count for debugging
+  const { count: totalCount } = await supabase
+    .from('pass_predictions')
+    .select('*', { count: 'exact', head: true });
+  console.log('[patterns] total rows in pass_predictions:', totalCount);
 
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -516,7 +525,12 @@ export async function analyzeHistoricalPatterns(): Promise<PatternAnalysis> {
     .gte('computed_at', sevenDaysAgo)
     .order('computed_at', { ascending: true });
 
-  if (error) throw new Error(error.message);
+  console.log('[patterns] 7-day query returned:', data?.length ?? 0, 'rows, error:', error?.message ?? 'none');
+
+  if (error) {
+    console.error('[patterns] Supabase query failed:', error.message, error);
+    return { available: false, message: 'Could not query history.', dataPoints: 0 };
+  }
 
   const rows = (data ?? []).filter(r => typeof r.signal_score === 'number');
 

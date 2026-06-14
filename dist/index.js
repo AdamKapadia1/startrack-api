@@ -218,10 +218,12 @@ app.get('/api/digest/send-now', async (_req, res) => {
 });
 app.get('/api/insights/patterns', async (_req, res) => {
     try {
-        res.json(await (0, passAgent_js_1.analyzeHistoricalPatterns)());
+        const result = await (0, passAgent_js_1.analyzeHistoricalPatterns)();
+        res.json(result);
     }
     catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('[patterns] unhandled error:', err.message, err.stack);
+        res.status(500).json({ error: err.message, available: false, dataPoints: 0 });
     }
 });
 app.get('/api/notifications/subscribe', (_req, res) => {

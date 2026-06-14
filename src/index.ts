@@ -237,8 +237,13 @@ app.get('/api/digest/send-now', async (_req, res) => {
 });
 
 app.get('/api/insights/patterns', async (_req, res) => {
-  try { res.json(await analyzeHistoricalPatterns()); }
-  catch (err: any) { res.status(500).json({ error: err.message }); }
+  try {
+    const result = await analyzeHistoricalPatterns();
+    res.json(result);
+  } catch (err: any) {
+    console.error('[patterns] unhandled error:', err.message, err.stack);
+    res.status(500).json({ error: err.message, available: false, dataPoints: 0 });
+  }
 });
 
 app.get('/api/notifications/subscribe', (_req, res) => {
