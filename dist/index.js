@@ -75,6 +75,7 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
             dopplerShiftHz: doppler?.dopplerShiftHz ?? null,
             dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
             orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
+            constellation: tle?.constellation ?? null,
         };
     });
     const bestSat = satellites[0] ?? null;
@@ -682,7 +683,7 @@ wss.on('connection', (ws, req) => {
 const PORT = process.env.PORT ?? 3001;
 server.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`StarTrack API listening on 0.0.0.0:${PORT} (HTTP + WebSocket)`);
-    // Fetch all constellations (Starlink + OneWeb + ISS + GPS) on startup
+    // Fetch all constellations (Starlink + OneWeb + ISS + GPS + Galileo + GLONASS) on startup
     (0, tleCache_js_1.getActiveSatellites)(9999).catch(err => console.error('[startup] TLE pre-warm failed:', err.message));
     // Notification check every 60 s
     setInterval(async () => {

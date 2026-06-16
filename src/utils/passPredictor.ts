@@ -63,6 +63,7 @@ export interface PositionNow {
   azimuth:         number;
   range:           number;
   dopplerShiftKHz: number | null;
+  constellation:   string;
 }
 
 const STARLINK_FREQ_HZ = 10.7e9;
@@ -101,6 +102,7 @@ export function getPositionsNow(
         azimuth:         Math.round(la1.az    * 10) / 10,
         range:           Math.round(la1.range),
         dopplerShiftKHz: dopplerKHz,
+        constellation:   tle.constellation,
       });
     } catch { /* skip invalid TLE */ }
   }

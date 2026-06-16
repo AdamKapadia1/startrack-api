@@ -113,6 +113,7 @@ function getPositionsNow(tles, lat, lon, altKm) {
                 azimuth: Math.round(la1.az * 10) / 10,
                 range: Math.round(la1.range),
                 dopplerShiftKHz: dopplerKHz,
+                constellation: tle.constellation,
             });
         }
         catch { /* skip invalid TLE */ }

@@ -93,6 +93,7 @@ async function getVisibleSatellitesData(
       dopplerShiftHz:  doppler?.dopplerShiftHz  ?? null,
       dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
       orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
+      constellation:   tle?.constellation ?? null,
     };
   });
 
@@ -718,7 +719,7 @@ const PORT = process.env.PORT ?? 3001;
 server.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`StarTrack API listening on 0.0.0.0:${PORT} (HTTP + WebSocket)`);
 
-  // Fetch all constellations (Starlink + OneWeb + ISS + GPS) on startup
+  // Fetch all constellations (Starlink + OneWeb + ISS + GPS + Galileo + GLONASS) on startup
   getActiveSatellites(9999).catch(err =>
     console.error('[startup] TLE pre-warm failed:', err.message),
   );
