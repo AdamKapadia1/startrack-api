@@ -9,6 +9,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL, sendDailyDigest, analyzeHistoricalPatterns } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, setOnTleRefresh } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
+import { validateAgainstSpaceTrack } from './services/spaceTrack.js';
 import { calculateDoppler, calculateOrbitalSpeedFromTle } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 import { HORIZON_PRESETS, FLAT_HORIZON, parseCustomHorizon } from './utils/horizonProfile.js';
@@ -517,6 +518,58 @@ app.get('/api/validation/results', async (_req, res) => {
   }
 });
 
+// ── Space-Track.org validation (secondary TLE source) ─────────────────────────
+
+function findTleByNoradId(noradId: number) {
+  return getAllSatellites().find(tle => tleMeta(tle.line1).noradId === noradId);
+}
+
+app.get('/api/validate/spacetrack/:noradId', async (req: Request, res: Response) => {
+  try {
+    const noradId = req.params.noradId as string;
+    await getActiveSatellites(1);
+    const celestrakSat = findTleByNoradId(parseInt(noradId, 10));
+
+    if (!celestrakSat) {
+      res.status(404).json({ error: 'Satellite not found in CelesTrak cache' });
+      return;
+    }
+
+    const validation = await validateAgainstSpaceTrack(noradId, {
+      line1: celestrakSat.line1,
+      line2: celestrakSat.line2,
+    });
+
+    res.json(validation);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function runDailyValidation() {
+  await getActiveSatellites(1);
+  const visible = getVisibleNow(getAllSatellites(), DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M / 1000, 0);
+  const sample  = visible
+    .map(v => findTleByName(v.satname))
+    .filter((tle): tle is NonNullable<typeof tle> => !!tle)
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 10);
+
+  let matchCount = 0;
+  for (const tle of sample) {
+    const { noradId } = tleMeta(tle.line1);
+    try {
+      const result = await validateAgainstSpaceTrack(String(noradId), tle);
+      if (result.matches) matchCount++;
+    } catch (err: any) {
+      console.error('[validation] space-track check failed for', tle.name, err.message);
+    }
+    await new Promise(resolve => setTimeout(resolve, 2_500)); // respect Space-Track rate limit
+  }
+
+  console.log(`[validation] ${matchCount}/${sample.length} satellites matched Space-Track data`);
+}
+
 // ── Anthropic client ─────────────────────────────────────────────────────────
 const anthropic = new Anthropic({
   apiKey:  process.env.ANTHROPIC_API_KEY,
@@ -651,7 +704,8 @@ Answer the user's question conversationally and precisely. Use the real data abo
 });
 
 // ── Daily digest state ────────────────────────────────────────────────────────
-let lastDigestDate: string | null = null;
+let lastDigestDate:     string | null = null;
+let lastValidationDate: string | null = null;
 
 // ── HTTP + WebSocket server ───────────────────────────────────────────────────
 const server  = http.createServer(app);
@@ -775,6 +829,30 @@ server.listen(Number(PORT), '0.0.0.0', () => {
       }
     }
   }, 60_000);
+
+  // Daily Space-Track validation at 7:00 AM UK time — check every minute.
+  // Only runs if SPACETRACK_USERNAME/PASSWORD are set; this is a credibility
+  // check (logged sample match-rate), not a real-time data path.
+  if (process.env.SPACETRACK_USERNAME && process.env.SPACETRACK_PASSWORD) {
+    setInterval(async () => {
+      const ukTime  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/London' }));
+      const hours   = ukTime.getHours();
+      const minutes = ukTime.getMinutes();
+      if (hours === 7 && minutes === 0) {
+        const today = ukTime.toDateString();
+        if (lastValidationDate !== today) {
+          lastValidationDate = today;
+          try {
+            await runDailyValidation();
+          } catch (err: any) {
+            console.error('[validation] daily Space-Track run failed:', err.message);
+          }
+        }
+      }
+    }, 60_000);
+  } else {
+    console.log('[validation] SPACETRACK_USERNAME/PASSWORD not set — daily Space-Track validation disabled');
+  }
 
   // Keep Railway awake — ping /health every 4 min so the dyno never sleeps
   const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
