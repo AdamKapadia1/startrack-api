@@ -331,6 +331,162 @@ app.get('/api/history', async (_req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+// ── Prediction validation against Heavens-Above ───────────────────────────────
+// NORAD ID + TLE epoch for a TLE, using the same parsing as /api/satellites/tle
+function tleMeta(line1) {
+    const noradId = parseInt(line1.substring(2, 7).trim(), 10);
+    const epochStr = line1.substring(18, 32).trim();
+    const yr2 = parseInt(epochStr.substring(0, 2), 10);
+    const dayOfYear = parseFloat(epochStr.substring(2));
+    const fullYear = yr2 >= 57 ? 1900 + yr2 : 2000 + yr2;
+    const epochMs = Date.UTC(fullYear, 0, 1) + (dayOfYear - 1) * 86400000;
+    return { noradId, epochIso: new Date(epochMs).toISOString() };
+}
+const HIGH_VALUE_MIN_EL = 70;
+app.get('/api/validation/log-predictions', async (_req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        await (0, tleCache_js_1.getActiveSatellites)(1);
+        const tles = (0, tleCache_js_1.getAllSatellites)();
+        const passes = (0, passPredictor_js_1.predictPasses)(tles, DEFAULT_LAT, DEFAULT_LON, DEFAULT_ALT_M / 1000, 1, 60, HIGH_VALUE_MIN_EL);
+        const rows = passes.map(p => {
+            const tle = (0, tleCache_js_1.findTleByName)(p.satname);
+            const meta = tle ? tleMeta(tle.line1) : null;
+            return {
+                satellite_name: p.satname,
+                norad_id: meta?.noradId ?? null,
+                predicted_start_time: new Date(p.startUTC * 1000).toISOString(),
+                predicted_peak_time: new Date(p.maxUTC * 1000).toISOString(),
+                predicted_end_time: new Date(p.endUTC * 1000).toISOString(),
+                predicted_max_elevation: p.maxEl,
+                predicted_max_azimuth: p.maxAz,
+                tle_epoch: meta?.epochIso ?? null,
+            };
+        });
+        if (rows.length > 0) {
+            const { error } = await supabase.from('prediction_validation').insert(rows);
+            if (error)
+                throw new Error(error.message);
+        }
+        res.json({ logged: rows.length, passes: rows });
+    }
+    catch (err) {
+        console.error('[validation] log-predictions failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+app.get('/api/validation/checklist', async (_req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        const { data, error } = await supabase
+            .from('prediction_validation')
+            .select('*')
+            .eq('validated', false)
+            .order('predicted_peak_time', { ascending: true })
+            .limit(10);
+        if (error)
+            throw new Error(error.message);
+        const checklist = (data ?? []).map(row => ({
+            id: row.id,
+            satelliteName: row.satellite_name,
+            noradId: row.norad_id,
+            predictedPeakTime: row.predicted_peak_time,
+            predictedMaxElevation: row.predicted_max_elevation,
+            heavensAboveUrl: `https://www.heavens-above.com/PassSummary.aspx?satid=${row.norad_id}&lat=${DEFAULT_LAT}&lng=${DEFAULT_LON}&loc=Tring&alt=${DEFAULT_ALT_M}&tz=GMT`,
+        }));
+        res.json({
+            instructions: 'Open each heavensAboveUrl, find the matching pass, and POST the actual peak time and max elevation to /api/validation/record-actual with { id, actualPeakTime, actualMaxElevation }.',
+            checklist,
+        });
+    }
+    catch (err) {
+        console.error('[validation] checklist failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+app.post('/api/validation/record-actual', async (req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        const { id, actualPeakTime, actualMaxElevation } = req.body;
+        if (!id || !actualPeakTime || actualMaxElevation == null) {
+            res.status(400).json({ error: 'id, actualPeakTime, and actualMaxElevation are required' });
+            return;
+        }
+        const { data: existing, error: fetchError } = await supabase
+            .from('prediction_validation')
+            .select('predicted_peak_time, predicted_max_elevation')
+            .eq('id', id)
+            .single();
+        if (fetchError)
+            throw new Error(fetchError.message);
+        if (!existing) {
+            res.status(404).json({ error: `No prediction with id ${id}` });
+            return;
+        }
+        const timeDelta = Math.abs((new Date(actualPeakTime).getTime() - new Date(existing.predicted_peak_time).getTime()) / 1000);
+        const elevationDelta = Math.abs(actualMaxElevation - existing.predicted_max_elevation);
+        const { error: updateError } = await supabase
+            .from('prediction_validation')
+            .update({
+            actual_peak_time: actualPeakTime,
+            actual_max_elevation: actualMaxElevation,
+            time_delta_seconds: timeDelta,
+            elevation_delta_degrees: elevationDelta,
+            validated: true,
+        })
+            .eq('id', id);
+        if (updateError)
+            throw new Error(updateError.message);
+        res.json({ timeDelta, elevationDelta, accurate: timeDelta < 5 && elevationDelta < 1 });
+    }
+    catch (err) {
+        console.error('[validation] record-actual failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+app.get('/api/validation/results', async (_req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        const { data, error } = await supabase
+            .from('prediction_validation')
+            .select('time_delta_seconds, elevation_delta_degrees')
+            .eq('validated', true);
+        if (error)
+            throw new Error(error.message);
+        const rows = data ?? [];
+        if (rows.length === 0) {
+            res.json({ validatedCount: 0, summary: 'No validated predictions yet.' });
+            return;
+        }
+        const avgTimeDelta = rows.reduce((a, r) => a + (r.time_delta_seconds ?? 0), 0) / rows.length;
+        const avgElevationDelta = rows.reduce((a, r) => a + (r.elevation_delta_degrees ?? 0), 0) / rows.length;
+        const accurateCount = rows.filter(r => (r.time_delta_seconds ?? Infinity) < 5 && (r.elevation_delta_degrees ?? Infinity) < 1).length;
+        const accuracyRate = (accurateCount / rows.length) * 100;
+        res.json({
+            validatedCount: rows.length,
+            avgTimeDeltaSeconds: parseFloat(avgTimeDelta.toFixed(2)),
+            avgElevationDeltaDegrees: parseFloat(avgElevationDelta.toFixed(2)),
+            accuracyRate: parseFloat(accuracyRate.toFixed(1)),
+            summary: `Based on ${rows.length} validated pass${rows.length === 1 ? '' : 'es'}, predictions are accurate to within 5s/1° on ${accuracyRate.toFixed(1)}% of passes (avg time delta ${avgTimeDelta.toFixed(1)}s, avg elevation delta ${avgElevationDelta.toFixed(2)}°).`,
+        });
+    }
+    catch (err) {
+        console.error('[validation] results failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
 // ── Anthropic client ─────────────────────────────────────────────────────────
 const anthropic = new sdk_1.default({
     apiKey: process.env.ANTHROPIC_API_KEY,
