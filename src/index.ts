@@ -11,6 +11,8 @@ import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, set
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
 import { calculateDoppler, calculateOrbitalSpeedFromTle } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
+import { HORIZON_PRESETS, FLAT_HORIZON, parseCustomHorizon } from './utils/horizonProfile.js';
+import type { HorizonProfile } from './utils/horizonProfile.js';
 
 dotenv.config();
 
@@ -34,6 +36,17 @@ function parseObs(req: Request) {
   const lon  = isNaN(qLon) ? DEFAULT_LON   : qLon;
   const altM = isNaN(qAlt) ? DEFAULT_ALT_M : qAlt;
   return { lat, lon, altM, altKm: altM / 1000 };
+}
+
+// ── parseHorizonProfile ─────────────────────────────────────────────────────
+function parseHorizonProfile(req: Request): HorizonProfile {
+  const custom = (req.query.horizonCustom as string)?.trim();
+  if (custom) {
+    const parsed = parseCustomHorizon(custom);
+    if (parsed) return parsed;
+  }
+  const preset = (req.query.horizon as string)?.trim().toLowerCase();
+  return (preset && HORIZON_PRESETS[preset]) || FLAT_HORIZON;
 }
 
 
@@ -317,7 +330,8 @@ app.get('/api/satellites/passes', async (req: Request, res: Response) => {
   const tle = findTleByName(name);
   if (!tle) { res.status(404).json({ error: `TLE not found for "${name}"` }); return; }
 
-  const passes = predictPasses([tle], lat, lon, altM / 1000, 7, 60, 10);
+  const horizonProfile = parseHorizonProfile(req);
+  const passes = predictPasses([tle], lat, lon, altM / 1000, 7, 60, 10, horizonProfile);
   const result = passes
     .sort((a, b) => a.startUTC - b.startUTC)
     .slice(0, 10)

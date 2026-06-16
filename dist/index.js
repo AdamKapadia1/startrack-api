@@ -16,6 +16,7 @@ const tleCache_js_1 = require("./utils/tleCache.js");
 const passPredictor_js_1 = require("./utils/passPredictor.js");
 const doppler_js_1 = require("./utils/doppler.js");
 const signalModel_js_1 = require("./utils/signalModel.js");
+const horizonProfile_js_1 = require("./utils/horizonProfile.js");
 dotenv_1.default.config();
 const DEFAULT_LAT = 51.7957;
 const DEFAULT_LON = -0.6572;
@@ -35,6 +36,17 @@ function parseObs(req) {
     const lon = isNaN(qLon) ? DEFAULT_LON : qLon;
     const altM = isNaN(qAlt) ? DEFAULT_ALT_M : qAlt;
     return { lat, lon, altM, altKm: altM / 1000 };
+}
+// ── parseHorizonProfile ─────────────────────────────────────────────────────
+function parseHorizonProfile(req) {
+    const custom = req.query.horizonCustom?.trim();
+    if (custom) {
+        const parsed = (0, horizonProfile_js_1.parseCustomHorizon)(custom);
+        if (parsed)
+            return parsed;
+    }
+    const preset = req.query.horizon?.trim().toLowerCase();
+    return (preset && horizonProfile_js_1.HORIZON_PRESETS[preset]) || horizonProfile_js_1.FLAT_HORIZON;
 }
 // ── Caches ────────────────────────────────────────────────────────────────────
 const _visibleCacheMap = new Map();
@@ -297,7 +309,8 @@ app.get('/api/satellites/passes', async (req, res) => {
         res.status(404).json({ error: `TLE not found for "${name}"` });
         return;
     }
-    const passes = (0, passPredictor_js_1.predictPasses)([tle], lat, lon, altM / 1000, 7, 60, 10);
+    const horizonProfile = parseHorizonProfile(req);
+    const passes = (0, passPredictor_js_1.predictPasses)([tle], lat, lon, altM / 1000, 7, 60, 10, horizonProfile);
     const result = passes
         .sort((a, b) => a.startUTC - b.startUTC)
         .slice(0, 10)

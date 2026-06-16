@@ -37,6 +37,7 @@ exports.getVisibleNow = getVisibleNow;
 exports.getPositionsNow = getPositionsNow;
 exports.predictPasses = predictPasses;
 const satellite = __importStar(require("satellite.js"));
+const horizonProfile_js_1 = require("./horizonProfile.js");
 const DEG = Math.PI / 180;
 const RAD = 180 / Math.PI;
 function makeObs(lat, lon, altKm) {
@@ -125,7 +126,7 @@ function getPositionsNow(tles, lat, lon, altKm) {
  * daysAhead=7, stepSeconds=60, minEl=30 gives ~10 seconds compute for 100 sats,
  * which is cached for several hours.
  */
-function predictPasses(tles, lat, lon, altKm, daysAhead = 7, stepSeconds = 60, minEl = 30) {
+function predictPasses(tles, lat, lon, altKm, daysAhead = 7, stepSeconds = 60, minEl = 30, horizonProfile = horizonProfile_js_1.FLAT_HORIZON) {
     const obs = makeObs(lat, lon, altKm);
     const nowMs = Date.now();
     const endMs = nowMs + daysAhead * 86400000;
@@ -140,7 +141,10 @@ function predictPasses(tles, lat, lon, altKm, daysAhead = 7, stepSeconds = 60, m
                 const la = getLook(satrec, new Date(t), obs);
                 if (!la)
                     continue;
-                if (la.el >= minEl) {
+                // A horizon obstruction raises the visibility floor for this azimuth above
+                // the caller's quality threshold (minEl), so AOS/LOS reflect the user's terrain.
+                const effectiveMinEl = Math.max(minEl, (0, horizonProfile_js_1.getMinElevationForAzimuth)(horizonProfile, la.az));
+                if (la.el >= effectiveMinEl) {
                     if (!inPass) {
                         inPass = true;
                         s0 = Math.floor(t / 1000);

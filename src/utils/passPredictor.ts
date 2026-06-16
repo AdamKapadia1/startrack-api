@@ -1,5 +1,7 @@
 import * as satellite from 'satellite.js';
 import type { TleEntry } from './tleCache.js';
+import type { HorizonProfile } from './horizonProfile.js';
+import { FLAT_HORIZON, getMinElevationForAzimuth } from './horizonProfile.js';
 
 const DEG = Math.PI / 180;
 const RAD = 180 / Math.PI;
@@ -123,9 +125,10 @@ export interface PredictedPass {
 export function predictPasses(
   tles: TleEntry[],
   lat: number, lon: number, altKm: number,
-  daysAhead   = 7,
-  stepSeconds = 60,
-  minEl       = 30,
+  daysAhead     = 7,
+  stepSeconds   = 60,
+  minEl         = 30,
+  horizonProfile: HorizonProfile = FLAT_HORIZON,
 ): PredictedPass[] {
   const obs    = makeObs(lat, lon, altKm);
   const nowMs  = Date.now();
@@ -143,7 +146,11 @@ export function predictPasses(
         const la = getLook(satrec, new Date(t), obs);
         if (!la) continue;
 
-        if (la.el >= minEl) {
+        // A horizon obstruction raises the visibility floor for this azimuth above
+        // the caller's quality threshold (minEl), so AOS/LOS reflect the user's terrain.
+        const effectiveMinEl = Math.max(minEl, getMinElevationForAzimuth(horizonProfile, la.az));
+
+        if (la.el >= effectiveMinEl) {
           if (!inPass) {
             inPass = true;
             s0 = Math.floor(t / 1000); az0 = la.az;
