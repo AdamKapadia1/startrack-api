@@ -2,10 +2,32 @@ import * as satellite from 'satellite.js';
 
 const STARLINK_FREQ_HZ   = 10.7e9;     // Ku-band downlink ~10.7 GHz
 const SPEED_OF_LIGHT_MS  = 299_792_458; // m/s
+const FALLBACK_SPEED_KM_S = 7.5;        // generic LEO average, used only if propagation fails
 
 export interface DopplerResult {
   dopplerShiftHz:  number;
   dopplerShiftKHz: number;
+}
+
+// True orbital speed for this specific satellite, from its SGP4 velocity vector (km/s, ECI frame)
+export function calculateOrbitalSpeed(satrec: satellite.SatRec, date: Date): number {
+  try {
+    const pv = satellite.propagate(satrec, date);
+    const velocity = (pv as any).velocity;
+    if (!velocity || velocity === false) return FALLBACK_SPEED_KM_S;
+    return Math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2);
+  } catch {
+    return FALLBACK_SPEED_KM_S;
+  }
+}
+
+export function calculateOrbitalSpeedFromTle(line1: string, line2: string, date: Date = new Date()): number {
+  try {
+    const satrec = satellite.twoline2satrec(line1, line2);
+    return calculateOrbitalSpeed(satrec, date);
+  } catch {
+    return FALLBACK_SPEED_KM_S;
+  }
 }
 
 export function calculateDoppler(

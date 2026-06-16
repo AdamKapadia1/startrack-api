@@ -9,7 +9,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL, sendDailyDigest, analyzeHistoricalPatterns } from './agents/passAgent.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, setOnTleRefresh } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
-import { calculateDoppler } from './utils/doppler.js';
+import { calculateDoppler, calculateOrbitalSpeedFromTle } from './utils/doppler.js';
 import { scoreSignal, ScoreBreakdown } from './utils/signalModel.js';
 
 dotenv.config();
@@ -82,8 +82,9 @@ async function getVisibleSatellitesData(
   const visible = getVisibleNow(tles, lat, lon, altKm, 0);
 
   const satellites = visible.map(sat => {
-    const tle     = findTleByName(sat.satname);
-    const doppler = tle ? calculateDoppler(lat, lon, altKm, tle.line1, tle.line2) : null;
+    const tle           = findTleByName(sat.satname);
+    const doppler       = tle ? calculateDoppler(lat, lon, altKm, tle.line1, tle.line2) : null;
+    const orbitalSpeedKmS = tle ? calculateOrbitalSpeedFromTle(tle.line1, tle.line2) : null;
     return {
       satname:         sat.satname,
       elevation:       sat.elevation,
@@ -91,6 +92,7 @@ async function getVisibleSatellitesData(
       range:           sat.range,
       dopplerShiftHz:  doppler?.dopplerShiftHz  ?? null,
       dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
+      orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
     };
   });
 
@@ -286,6 +288,9 @@ app.get('/api/satellites/tle', async (req: Request, res: Response) => {
   const mu            = 398_600.4418;                                        // km³/s²
   const semiMajorAxis = Math.cbrt(mu * Math.pow((period * 60) / (2 * Math.PI), 2));
   const meanAltitude  = Math.round(semiMajorAxis - 6_371);
+  const orbitalSpeedKmS = parseFloat(calculateOrbitalSpeedFromTle(line1, line2).toFixed(2));
+
+  console.log(`[orbital-speed] ${tle.name}: altitude=${meanAltitude}km, speed=${orbitalSpeedKmS}km/s`);
 
   res.json({
     name:         tle.name,
@@ -298,6 +303,7 @@ app.get('/api/satellites/tle', async (req: Request, res: Response) => {
     eccentricity: parseFloat(eccentricity.toFixed(7)),
     period:       parseFloat(period.toFixed(2)),
     meanAltitude,
+    orbitalSpeedKmS,
   });
 });
 

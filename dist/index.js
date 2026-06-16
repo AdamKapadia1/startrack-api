@@ -66,6 +66,7 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
     const satellites = visible.map(sat => {
         const tle = (0, tleCache_js_1.findTleByName)(sat.satname);
         const doppler = tle ? (0, doppler_js_1.calculateDoppler)(lat, lon, altKm, tle.line1, tle.line2) : null;
+        const orbitalSpeedKmS = tle ? (0, doppler_js_1.calculateOrbitalSpeedFromTle)(tle.line1, tle.line2) : null;
         return {
             satname: sat.satname,
             elevation: sat.elevation,
@@ -73,6 +74,7 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
             range: sat.range,
             dopplerShiftHz: doppler?.dopplerShiftHz ?? null,
             dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
+            orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
         };
     });
     const bestSat = satellites[0] ?? null;
@@ -265,6 +267,8 @@ app.get('/api/satellites/tle', async (req, res) => {
     const mu = 398600.4418; // km³/s²
     const semiMajorAxis = Math.cbrt(mu * Math.pow((period * 60) / (2 * Math.PI), 2));
     const meanAltitude = Math.round(semiMajorAxis - 6371);
+    const orbitalSpeedKmS = parseFloat((0, doppler_js_1.calculateOrbitalSpeedFromTle)(line1, line2).toFixed(2));
+    console.log(`[orbital-speed] ${tle.name}: altitude=${meanAltitude}km, speed=${orbitalSpeedKmS}km/s`);
     res.json({
         name: tle.name,
         tle_line1: line1,
@@ -276,6 +280,7 @@ app.get('/api/satellites/tle', async (req, res) => {
         eccentricity: parseFloat(eccentricity.toFixed(7)),
         period: parseFloat(period.toFixed(2)),
         meanAltitude,
+        orbitalSpeedKmS,
     });
 });
 app.get('/api/satellites/passes', async (req, res) => {

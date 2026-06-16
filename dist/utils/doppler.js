@@ -33,10 +33,35 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.calculateOrbitalSpeed = calculateOrbitalSpeed;
+exports.calculateOrbitalSpeedFromTle = calculateOrbitalSpeedFromTle;
 exports.calculateDoppler = calculateDoppler;
 const satellite = __importStar(require("satellite.js"));
 const STARLINK_FREQ_HZ = 10.7e9; // Ku-band downlink ~10.7 GHz
 const SPEED_OF_LIGHT_MS = 299792458; // m/s
+const FALLBACK_SPEED_KM_S = 7.5; // generic LEO average, used only if propagation fails
+// True orbital speed for this specific satellite, from its SGP4 velocity vector (km/s, ECI frame)
+function calculateOrbitalSpeed(satrec, date) {
+    try {
+        const pv = satellite.propagate(satrec, date);
+        const velocity = pv.velocity;
+        if (!velocity || velocity === false)
+            return FALLBACK_SPEED_KM_S;
+        return Math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2);
+    }
+    catch {
+        return FALLBACK_SPEED_KM_S;
+    }
+}
+function calculateOrbitalSpeedFromTle(line1, line2, date = new Date()) {
+    try {
+        const satrec = satellite.twoline2satrec(line1, line2);
+        return calculateOrbitalSpeed(satrec, date);
+    }
+    catch {
+        return FALLBACK_SPEED_KM_S;
+    }
+}
 function calculateDoppler(obsLat, obsLon, obsAltKm, line1, line2) {
     try {
         const satrec = satellite.twoline2satrec(line1, line2);
