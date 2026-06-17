@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createClient } from '@supabase/supabase-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { getPassRecommendation, checkAndNotify, getAlertConfig, setAlertConfig, NTFY_SUBSCRIBE_URL, sendDailyDigest, analyzeHistoricalPatterns } from './agents/passAgent.js';
+import * as satelliteJs from 'satellite.js';
 import { getActiveSatellites, getAllSatellites, getTleStatus, findTleByName, setOnTleRefresh } from './utils/tleCache.js';
 import { getVisibleNow, getPositionsNow, predictPasses } from './utils/passPredictor.js';
 import { validateAgainstSpaceTrack } from './services/spaceTrack.js';
@@ -820,6 +821,39 @@ app.get('/api/share/:id', async (req: Request, res: Response) => {
       .update({ view_count: (data.view_count ?? 0) + 1 })
       .eq('id', req.params.id);
     res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Ground track ──────────────────────────────────────────────────────────────
+app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
+  try {
+    const name = String(req.query.name ?? '');
+    const tle  = findTleByName(name);
+    if (!tle) { res.status(404).json({ error: 'Satellite not found' }); return; }
+
+    const satrec = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+    const points: { lat: number; lon: number; time: string }[] = [];
+    const now    = new Date();
+
+    for (let i = 0; i <= 100; i++) {
+      const t  = new Date(now.getTime() + i * 60_000);
+      const pv = satelliteJs.propagate(satrec, t);
+      const pos = (pv as any)?.position;
+      if (pos && pos !== false) {
+        const gmst = satelliteJs.gstime(t);
+        const geo  = satelliteJs.eciToGeodetic(pos, gmst);
+        points.push({
+          lat:  satelliteJs.degreesLat(geo.latitude),
+          lon:  satelliteJs.degreesLong(geo.longitude),
+          time: t.toISOString(),
+        });
+      }
+    }
+
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ satelliteName: name, points });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
