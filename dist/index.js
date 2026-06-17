@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -12,6 +45,7 @@ const ws_1 = require("ws");
 const supabase_js_1 = require("@supabase/supabase-js");
 const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const passAgent_js_1 = require("./agents/passAgent.js");
+const satelliteJs = __importStar(require("satellite.js"));
 const tleCache_js_1 = require("./utils/tleCache.js");
 const passPredictor_js_1 = require("./utils/passPredictor.js");
 const spaceTrack_js_1 = require("./services/spaceTrack.js");
@@ -59,6 +93,29 @@ const VISIBLE_TTL_S = 5 * 60;
 });
 const _weatherCacheMap = new Map();
 const WEATHER_TTL_S = 10 * 60;
+// ── Footprint helpers ─────────────────────────────────────────────────────────
+function beamHalfAngle(constellation) {
+    switch ((constellation ?? '').toUpperCase()) {
+        case 'STARLINK': return 25;
+        case 'ONEWEB': return 30;
+        case 'GPS':
+        case 'GALILEO':
+        case 'GLONASS': return 70;
+        default: return 25;
+    }
+}
+// Correct spherical geometry (law of sines) — gives ~256 km for Starlink at 550 km, 25°
+function calculateFootprintRadius(altKm, constellation) {
+    const R = 6371;
+    const θ_b = beamHalfAngle(constellation) * (Math.PI / 180);
+    const d = R + altKm;
+    const sinEdge = (d / R) * Math.sin(θ_b);
+    if (sinEdge >= 1)
+        return R * Math.acos(R / d); // beam past horizon
+    const edgeAngle = Math.PI - Math.asin(sinEdge); // obtuse (low-elevation edge)
+    const groundAngle = Math.PI - θ_b - edgeAngle;
+    return groundAngle > 0 ? Math.min(R * groundAngle, R * Math.acos(R / d)) : 0;
+}
 // ── Shared data functions (used by REST endpoints + WS broadcasts) ────────────
 async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, Hertfordshire') {
     const altKm = altM / 1000;
@@ -89,6 +146,25 @@ async function getVisibleSatellitesData(lat, lon, altM, locationName = 'Tring, H
             dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
             orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
             constellation: tle?.constellation ?? null,
+            ...(() => {
+                if (!tle)
+                    return { altKm: null, footprintRadiusKm: null };
+                try {
+                    const sr = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+                    const pv = satelliteJs.propagate(sr, new Date());
+                    const pos = pv?.position;
+                    if (!pos || pos === false)
+                        return { altKm: null, footprintRadiusKm: null };
+                    const alt = Math.sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2) - 6371;
+                    return {
+                        altKm: Math.round(alt),
+                        footprintRadiusKm: Math.round(calculateFootprintRadius(alt, tle.constellation ?? null)),
+                    };
+                }
+                catch {
+                    return { altKm: null, footprintRadiusKm: null };
+                }
+            })(),
         };
     });
     const bestSat = satellites[0] ?? null;
@@ -709,6 +785,154 @@ Answer the user's question conversationally and precisely. Use the real data abo
             res.write(`data: ${JSON.stringify({ error: true, message: err.message })}\n\n`);
             res.end();
         }
+    }
+});
+// ── /api/pass-card — server-generated OG image for satellite pass sharing ─────
+const passCardGenerator_js_1 = require("./services/passCardGenerator.js");
+app.get('/api/pass-card', (req, res) => {
+    try {
+        const { sat, date, time, el, quality, loc, score } = req.query;
+        const buffer = (0, passCardGenerator_js_1.generatePassCard)({
+            satelliteName: String(sat || 'Unknown'),
+            date: String(date || ''),
+            time: String(time || ''),
+            maxElevation: parseFloat(String(el || '0')),
+            quality: String(quality || 'Good'),
+            locationLabel: String(loc || 'your location'),
+            signalScore: score ? parseInt(String(score), 10) : undefined,
+        });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'public, max-age=3600');
+        res.send(buffer);
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// ── /api/share — database-backed shareable pass IDs ──────────────────────────
+const SHARE_SITE = 'https://startrack-delta.vercel.app';
+app.post('/api/share/create', async (req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        const { satelliteName, noradId, passTime, maxElevation, durationSeconds, quality, locationLabel, signalScore } = req.body;
+        const { data, error } = await supabase
+            .from('shared_passes')
+            .insert({
+            satellite_name: satelliteName,
+            norad_id: noradId ?? null,
+            pass_time: passTime,
+            max_elevation: maxElevation,
+            duration_seconds: durationSeconds ?? null,
+            quality: quality ?? null,
+            location_label: locationLabel ?? null,
+            signal_score: signalScore ?? null,
+        })
+            .select()
+            .single();
+        if (error)
+            throw error;
+        res.json({ id: data.id, url: `${SHARE_SITE}/pass?id=${data.id}` });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+app.get('/api/share/:id', async (req, res) => {
+    if (!supabase) {
+        res.status(503).json({ error: 'Supabase not configured' });
+        return;
+    }
+    try {
+        const { data, error } = await supabase
+            .from('shared_passes')
+            .select('*')
+            .eq('id', req.params.id)
+            .single();
+        if (error || !data) {
+            res.status(404).json({ error: 'Pass not found' });
+            return;
+        }
+        await supabase
+            .from('shared_passes')
+            .update({ view_count: (data.view_count ?? 0) + 1 })
+            .eq('id', req.params.id);
+        res.json(data);
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// ── 3D globe positions ────────────────────────────────────────────────────────
+app.get('/api/satellites/positions3d', async (_req, res) => {
+    try {
+        const tles = (0, tleCache_js_1.getAllSatellites)();
+        const now = new Date();
+        const gmst = satelliteJs.gstime(now);
+        const out = [];
+        for (const tle of tles) {
+            try {
+                const satrec = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+                const pv = satelliteJs.propagate(satrec, now);
+                const pos = pv?.position;
+                if (!pos || pos === false)
+                    continue;
+                const geo = satelliteJs.eciToGeodetic(pos, gmst);
+                const altKm = geo.height;
+                out.push({
+                    satname: tle.name,
+                    lat: satelliteJs.degreesLat(geo.latitude),
+                    lon: satelliteJs.degreesLong(geo.longitude),
+                    altKm,
+                    constellation: tle.constellation ?? null,
+                    footprintRadiusKm: Math.round(calculateFootprintRadius(altKm, tle.constellation ?? null)),
+                });
+            }
+            catch { /* skip invalid TLE */ }
+        }
+        res.set('Cache-Control', 'public, max-age=5');
+        res.json(out);
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// ── Ground track ──────────────────────────────────────────────────────────────
+app.get('/api/satellites/groundtrack', async (req, res) => {
+    try {
+        const name = String(req.query.name ?? '');
+        const tle = (0, tleCache_js_1.findTleByName)(name);
+        if (!tle) {
+            res.status(404).json({ error: 'Satellite not found' });
+            return;
+        }
+        const satrec = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+        const points = [];
+        const now = new Date();
+        for (let i = 0; i <= 100; i++) {
+            const t = new Date(now.getTime() + i * 60000);
+            const pv = satelliteJs.propagate(satrec, t);
+            const pos = pv?.position;
+            if (pos && pos !== false) {
+                const gmst = satelliteJs.gstime(t);
+                const geo = satelliteJs.eciToGeodetic(pos, gmst);
+                points.push({
+                    lat: satelliteJs.degreesLat(geo.latitude),
+                    lon: satelliteJs.degreesLong(geo.longitude),
+                    altKm: geo.height,
+                    time: t.toISOString(),
+                });
+            }
+        }
+        const currentAltKm = points[0]?.altKm ?? 550;
+        const footprintRadiusKm = Math.round(calculateFootprintRadius(currentAltKm, tle.constellation ?? null));
+        res.set('Cache-Control', 'public, max-age=60');
+        res.json({ satelliteName: name, constellation: tle.constellation ?? null, footprintRadiusKm, points });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 // ── Daily digest state ────────────────────────────────────────────────────────
