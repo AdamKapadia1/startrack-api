@@ -778,6 +778,53 @@ app.get('/api/pass-card', (req: Request, res: Response) => {
   }
 });
 
+// ── /api/share — database-backed shareable pass IDs ──────────────────────────
+const SHARE_SITE = 'https://startrack-delta.vercel.app';
+
+app.post('/api/share/create', async (req: Request, res: Response) => {
+  if (!supabase) { res.status(503).json({ error: 'Supabase not configured' }); return; }
+  try {
+    const { satelliteName, noradId, passTime, maxElevation, durationSeconds, quality, locationLabel, signalScore } = req.body;
+    const { data, error } = await supabase
+      .from('shared_passes')
+      .insert({
+        satellite_name:   satelliteName,
+        norad_id:         noradId   ?? null,
+        pass_time:        passTime,
+        max_elevation:    maxElevation,
+        duration_seconds: durationSeconds ?? null,
+        quality:          quality   ?? null,
+        location_label:   locationLabel ?? null,
+        signal_score:     signalScore ?? null,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ id: data.id, url: `${SHARE_SITE}/pass?id=${data.id}` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/share/:id', async (req: Request, res: Response) => {
+  if (!supabase) { res.status(503).json({ error: 'Supabase not configured' }); return; }
+  try {
+    const { data, error } = await supabase
+      .from('shared_passes')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+    if (error || !data) { res.status(404).json({ error: 'Pass not found' }); return; }
+    await supabase
+      .from('shared_passes')
+      .update({ view_count: (data.view_count ?? 0) + 1 })
+      .eq('id', req.params.id);
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Daily digest state ────────────────────────────────────────────────────────
 let lastDigestDate:     string | null = null;
 let lastValidationDate: string | null = null;
