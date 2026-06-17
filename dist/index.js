@@ -308,6 +308,46 @@ app.get('/api/digest/send-now', async (_req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+app.get('/api/insights/heatmap', async (req, res) => {
+    if (!supabase) {
+        res.json({ days: [] });
+        return;
+    }
+    try {
+        const days = Math.min(365, Math.max(7, parseInt(String(req.query.days || '90'), 10)));
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - days);
+        const { data, error } = await supabase
+            .from('pass_predictions')
+            .select('computed_at, signal_score')
+            .gte('computed_at', startDate.toISOString())
+            .order('computed_at', { ascending: true });
+        if (error)
+            throw new Error(error.message);
+        if (!data || data.length === 0) {
+            res.json({ days: [] });
+            return;
+        }
+        const buckets = {};
+        for (const row of data) {
+            const score = Number(row.signal_score);
+            if (!Number.isFinite(score))
+                continue;
+            const day = new Date(row.computed_at).toISOString().split('T')[0];
+            (buckets[day] ?? (buckets[day] = [])).push(score);
+        }
+        const result = Object.entries(buckets).map(([date, scores]) => ({
+            date,
+            avgScore: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length),
+            sampleCount: scores.length,
+        }));
+        res.set('Cache-Control', 'public, max-age=300');
+        res.json({ days: result });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 app.get('/api/insights/patterns', async (_req, res) => {
     try {
         const result = await (0, passAgent_js_1.analyzeHistoricalPatterns)();
