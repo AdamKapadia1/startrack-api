@@ -71,6 +71,30 @@ const _weatherCacheMap = new Map<string, {
 }>();
 const WEATHER_TTL_S = 10 * 60;
 
+// ── Footprint helpers ─────────────────────────────────────────────────────────
+function beamHalfAngle(constellation: string | null): number {
+  switch ((constellation ?? '').toUpperCase()) {
+    case 'STARLINK':  return 25;
+    case 'ONEWEB':    return 30;
+    case 'GPS':
+    case 'GALILEO':
+    case 'GLONASS':   return 70;
+    default:          return 25;
+  }
+}
+
+// Correct spherical geometry (law of sines) — gives ~256 km for Starlink at 550 km, 25°
+function calculateFootprintRadius(altKm: number, constellation: string | null): number {
+  const R   = 6371;
+  const θ_b = beamHalfAngle(constellation) * (Math.PI / 180);
+  const d   = R + altKm;
+  const sinEdge = (d / R) * Math.sin(θ_b);
+  if (sinEdge >= 1) return R * Math.acos(R / d);  // beam past horizon
+  const edgeAngle  = Math.PI - Math.asin(sinEdge); // obtuse (low-elevation edge)
+  const groundAngle = Math.PI - θ_b - edgeAngle;
+  return groundAngle > 0 ? Math.min(R * groundAngle, R * Math.acos(R / d)) : 0;
+}
+
 // ── Shared data functions (used by REST endpoints + WS broadcasts) ────────────
 
 async function getVisibleSatellitesData(
@@ -109,6 +133,20 @@ async function getVisibleSatellitesData(
       dopplerShiftKHz: doppler?.dopplerShiftKHz ?? null,
       orbitalSpeedKmS: orbitalSpeedKmS !== null ? parseFloat(orbitalSpeedKmS.toFixed(2)) : null,
       constellation:   tle?.constellation ?? null,
+      ...(() => {
+        if (!tle) return { altKm: null, footprintRadiusKm: null };
+        try {
+          const sr  = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+          const pv  = satelliteJs.propagate(sr, new Date());
+          const pos = (pv as any)?.position;
+          if (!pos || pos === false) return { altKm: null, footprintRadiusKm: null };
+          const alt = Math.sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2) - 6371;
+          return {
+            altKm:             Math.round(alt),
+            footprintRadiusKm: Math.round(calculateFootprintRadius(alt, tle.constellation ?? null)),
+          };
+        } catch { return { altKm: null, footprintRadiusKm: null }; }
+      })(),
     };
   });
 
@@ -832,7 +870,7 @@ app.get('/api/satellites/positions3d', async (_req: Request, res: Response) => {
     const tles = getAllSatellites();
     const now  = new Date();
     const gmst = satelliteJs.gstime(now);
-    const out: { satname: string; lat: number; lon: number; altKm: number; constellation: string | null }[] = [];
+    const out: { satname: string; lat: number; lon: number; altKm: number; constellation: string | null; footprintRadiusKm: number }[] = [];
 
     for (const tle of tles) {
       try {
@@ -841,12 +879,14 @@ app.get('/api/satellites/positions3d', async (_req: Request, res: Response) => {
         const pos    = (pv as any)?.position;
         if (!pos || pos === false) continue;
         const geo = satelliteJs.eciToGeodetic(pos, gmst);
+        const altKm = geo.height;
         out.push({
-          satname:       tle.name,
-          lat:           satelliteJs.degreesLat(geo.latitude),
-          lon:           satelliteJs.degreesLong(geo.longitude),
-          altKm:         geo.height,
-          constellation: tle.constellation ?? null,
+          satname:           tle.name,
+          lat:               satelliteJs.degreesLat(geo.latitude),
+          lon:               satelliteJs.degreesLong(geo.longitude),
+          altKm,
+          constellation:     tle.constellation ?? null,
+          footprintRadiusKm: Math.round(calculateFootprintRadius(altKm, tle.constellation ?? null)),
         });
       } catch { /* skip invalid TLE */ }
     }
@@ -866,7 +906,7 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
     if (!tle) { res.status(404).json({ error: 'Satellite not found' }); return; }
 
     const satrec = satelliteJs.twoline2satrec(tle.line1, tle.line2);
-    const points: { lat: number; lon: number; time: string }[] = [];
+    const points: { lat: number; lon: number; altKm: number; time: string }[] = [];
     const now    = new Date();
 
     for (let i = 0; i <= 100; i++) {
@@ -877,15 +917,19 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
         const gmst = satelliteJs.gstime(t);
         const geo  = satelliteJs.eciToGeodetic(pos, gmst);
         points.push({
-          lat:  satelliteJs.degreesLat(geo.latitude),
-          lon:  satelliteJs.degreesLong(geo.longitude),
-          time: t.toISOString(),
+          lat:   satelliteJs.degreesLat(geo.latitude),
+          lon:   satelliteJs.degreesLong(geo.longitude),
+          altKm: geo.height,
+          time:  t.toISOString(),
         });
       }
     }
 
+    const currentAltKm       = points[0]?.altKm ?? 550;
+    const footprintRadiusKm  = Math.round(calculateFootprintRadius(currentAltKm, tle.constellation ?? null));
+
     res.set('Cache-Control', 'public, max-age=60');
-    res.json({ satelliteName: name, points });
+    res.json({ satelliteName: name, constellation: tle.constellation ?? null, footprintRadiusKm, points });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
