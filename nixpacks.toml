@@ -1,2 +1,10 @@
 [phases.setup]
-nixPkgs = ["cairo", "pango", "libjpeg", "giflib", "pkg-config", "python3", "nodePackages.node-gyp"]
+aptPkgs = [
+  "libcairo2-dev",
+  "libpango1.0-dev",
+  "libjpeg-dev",
+  "libgif-dev",
+  "pkg-config",
+  "python3",
+  "build-essential"
+]
