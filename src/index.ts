@@ -755,6 +755,29 @@ Answer the user's question conversationally and precisely. Use the real data abo
   }
 });
 
+// ── /api/pass-card — server-generated OG image for satellite pass sharing ─────
+import { generatePassCard } from './services/passCardGenerator.js';
+
+app.get('/api/pass-card', (req: Request, res: Response) => {
+  try {
+    const { sat, date, time, el, quality, loc, score } = req.query;
+    const buffer = generatePassCard({
+      satelliteName: String(sat   || 'Unknown'),
+      date:          String(date  || ''),
+      time:          String(time  || ''),
+      maxElevation:  parseFloat(String(el || '0')),
+      quality:       String(quality || 'Good'),
+      locationLabel: String(loc   || 'your location'),
+      signalScore:   score ? parseInt(String(score), 10) : undefined,
+    });
+    res.set('Content-Type',  'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(buffer);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Daily digest state ────────────────────────────────────────────────────────
 let lastDigestDate:     string | null = null;
 let lastValidationDate: string | null = null;
