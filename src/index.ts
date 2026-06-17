@@ -826,6 +826,38 @@ app.get('/api/share/:id', async (req: Request, res: Response) => {
   }
 });
 
+// ── 3D globe positions ────────────────────────────────────────────────────────
+app.get('/api/satellites/positions3d', async (_req: Request, res: Response) => {
+  try {
+    const tles = getAllSatellites();
+    const now  = new Date();
+    const gmst = satelliteJs.gstime(now);
+    const out: { satname: string; lat: number; lon: number; altKm: number; constellation: string | null }[] = [];
+
+    for (const tle of tles) {
+      try {
+        const satrec = satelliteJs.twoline2satrec(tle.line1, tle.line2);
+        const pv     = satelliteJs.propagate(satrec, now);
+        const pos    = (pv as any)?.position;
+        if (!pos || pos === false) continue;
+        const geo = satelliteJs.eciToGeodetic(pos, gmst);
+        out.push({
+          satname:       tle.name,
+          lat:           satelliteJs.degreesLat(geo.latitude),
+          lon:           satelliteJs.degreesLong(geo.longitude),
+          altKm:         geo.height,
+          constellation: tle.constellation ?? null,
+        });
+      } catch { /* skip invalid TLE */ }
+    }
+
+    res.set('Cache-Control', 'public, max-age=5');
+    res.json(out);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Ground track ──────────────────────────────────────────────────────────────
 app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
   try {
