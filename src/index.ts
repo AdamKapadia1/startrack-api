@@ -985,11 +985,11 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
 // ── ISS info ──────────────────────────────────────────────────────────────────
 
 const NASA_ISS_IMAGES = [
-  'https://images-assets.nasa.gov/image/iss056e000236/iss056e000236~large.jpg',
-  'https://images-assets.nasa.gov/image/iss047e093413/iss047e093413~large.jpg',
-  'https://images-assets.nasa.gov/image/iss064e026035/iss064e026035~large.jpg',
-  'https://images-assets.nasa.gov/image/iss063e040872/iss063e040872~large.jpg',
-  'https://images-assets.nasa.gov/image/iss060e027826/iss060e027826~large.jpg',
+  'https://images-assets.nasa.gov/image/iss054e004111/iss054e004111~medium.jpg',
+  'https://images-assets.nasa.gov/image/iss054e004116/iss054e004116~medium.jpg',
+  'https://images-assets.nasa.gov/image/iss021e030674/iss021e030674~medium.jpg',
+  'https://images-assets.nasa.gov/image/iss021e030599/iss021e030599~medium.jpg',
+  'https://images-assets.nasa.gov/image/s129e007221/s129e007221~medium.jpg',
 ];
 
 app.get('/api/iss/info', async (req: Request, res: Response) => {
