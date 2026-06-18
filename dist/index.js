@@ -988,13 +988,36 @@ app.get('/api/satellites/groundtrack', async (req, res) => {
     }
 });
 // ── ISS info ──────────────────────────────────────────────────────────────────
-const NASA_ISS_IMAGES = [
-    'https://images-assets.nasa.gov/image/iss056e000236/iss056e000236~large.jpg',
-    'https://images-assets.nasa.gov/image/iss047e093413/iss047e093413~large.jpg',
-    'https://images-assets.nasa.gov/image/iss064e026035/iss064e026035~large.jpg',
-    'https://images-assets.nasa.gov/image/iss063e040872/iss063e040872~large.jpg',
-    'https://images-assets.nasa.gov/image/iss060e027826/iss060e027826~large.jpg',
+const NASA_ISS_PHOTO_FALLBACKS = [
+    'https://images-assets.nasa.gov/image/iss054e004111/iss054e004111~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss054e004116/iss054e004116~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss021e030674/iss021e030674~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss021e030599/iss021e030599~medium.jpg',
+    'https://images-assets.nasa.gov/image/s129e007221/s129e007221~medium.jpg',
 ];
+// Proxy endpoint — browser never hits NASA CDN directly
+app.get('/api/iss/photo', async (_req, res) => {
+    let imgUrl = NASA_ISS_PHOTO_FALLBACKS[Math.floor(Math.random() * NASA_ISS_PHOTO_FALLBACKS.length)];
+    try {
+        const search = await axios_1.default.get('https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20', { timeout: 5000 });
+        const items = (search.data?.collection?.items ?? []);
+        const valid = items.filter((i) => i.links?.[0]?.href);
+        if (valid.length > 0) {
+            imgUrl = valid[Math.floor(Math.random() * Math.min(valid.length, 10))].links[0].href;
+        }
+    }
+    catch { /* use fallback */ }
+    try {
+        const img = await axios_1.default.get(imgUrl, { responseType: 'arraybuffer', timeout: 8000 });
+        res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
+        res.set('Cache-Control', 'public, max-age=3600');
+        res.send(img.data);
+    }
+    catch {
+        // Last-resort: redirect to a known-good fallback rather than fail
+        res.redirect(302, NASA_ISS_PHOTO_FALLBACKS[0]);
+    }
+});
 app.get('/api/iss/info', async (req, res) => {
     try {
         await (0, tleCache_js_1.getActiveSatellites)(1);
@@ -1056,17 +1079,8 @@ app.get('/api/iss/info', async (req, res) => {
             }
             catch { /* skip pass */ }
         }
-        // ── NASA image (live fetch with hardcoded fallback) ────────────────────────
-        let nasaImageUrl = NASA_ISS_IMAGES[Math.floor(Math.random() * NASA_ISS_IMAGES.length)];
-        try {
-            const imgRes = await axios_1.default.get('https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20', { timeout: 5000 });
-            const items = (imgRes.data?.collection?.items ?? []);
-            const withLinks = items.filter(i => i.links?.[0]?.href);
-            if (withLinks.length > 0) {
-                nasaImageUrl = withLinks[Math.floor(Math.random() * Math.min(withLinks.length, 10))].links[0].href;
-            }
-        }
-        catch { /* use hardcoded fallback */ }
+        // Return a stable proxy URL — browser hits Railway, Railway hits NASA
+        const nasaImageUrl = '/api/iss/photo';
         res.set('Cache-Control', 'public, max-age=60');
         res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl });
     }
