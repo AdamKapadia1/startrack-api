@@ -17,15 +17,19 @@ const APP_URL    = 'https://startrackv1-ui.vercel.app';
 // ── Alert config ──────────────────────────────────────────────────────────────
 
 export interface AlertConfig {
-  minElevation:       number;
-  alertMinutesBefore: number;
-  enabled:            boolean;
+  minElevation:            number;
+  alertMinutesBefore:      number;
+  enabled:                 boolean;
+  favouriteSatellitesOnly: boolean;
+  favouriteSatelliteNames: string[];
 }
 
 const DEFAULT_ALERT_CONFIG: AlertConfig = {
-  minElevation:       60,
-  alertMinutesBefore: 10,
-  enabled:            true,
+  minElevation:            60,
+  alertMinutesBefore:      10,
+  enabled:                 true,
+  favouriteSatellitesOnly: false,
+  favouriteSatelliteNames: [],
 };
 
 let alertConfig: AlertConfig = { ...DEFAULT_ALERT_CONFIG };
@@ -199,16 +203,19 @@ function qualityLabel(score: number): string {
   return 'Poor';
 }
 
-async function sendNtfy(pass: Pass, minutesAway: number): Promise<void> {
-  const score    = passScore(pass.maxEl);
-  const quality  = qualityLabel(score);
-  const timeStr  = utcToLocal(pass.startUTC);
+async function sendNtfy(pass: Pass, minutesAway: number, isFavourite = false): Promise<void> {
+  const score     = passScore(pass.maxEl);
+  const quality   = qualityLabel(score);
+  const timeStr   = utcToLocal(pass.startUTC);
   const durationM = Math.round((pass.duration ?? 600) / 60);
 
-  const title    = `StarTrack — Pass in ${minutesAway} minute${minutesAway === 1 ? '' : 's'}`;
+  const title = isFavourite
+    ? `⭐ Your favourite ${pass.satname} is passing in ${minutesAway} minute${minutesAway === 1 ? '' : 's'}`
+    : `StarTrack — Pass in ${minutesAway} minute${minutesAway === 1 ? '' : 's'}`;
+
   const body     = `${pass.satname} reaches ${Math.round(pass.maxEl)}° at ${timeStr} BST. Signal score: ${score}/100. Duration: ~${durationM}m. Quality: ${quality}`;
   const priority = quality === 'Excellent' ? 'high' : 'default';
-  const tags     = quality === 'Excellent' ? 'satellite,starlink' : 'satellite';
+  const tags     = isFavourite ? 'star,satellite' : (quality === 'Excellent' ? 'satellite,starlink' : 'satellite');
 
   await axios.post(NTFY_URL, body, {
     headers: {
@@ -236,27 +243,45 @@ setInterval(() => {
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
   if (!alertConfig.enabled) return { checked: 0, alerted: 0, alerts: [] };
 
-  const passes       = await getAllStarlinkPasses(DEFAULT_OBS);
+  const isFavMode = alertConfig.favouriteSatellitesOnly && alertConfig.favouriteSatelliteNames.length > 0;
+
+  let passes: Pass[];
+
+  if (isFavMode) {
+    // Run pass prediction specifically for the named favourite satellites at a low min elevation (10°)
+    await getActiveSatellites(1);
+    const allTles  = getAllSatellites();
+    const favNames = alertConfig.favouriteSatelliteNames.map(n => n.toUpperCase());
+    const favTles  = allTles.filter(t => favNames.includes(t.name.toUpperCase()));
+    const altKm    = DEFAULT_OBS.alt / 1000;
+    const raw      = predictPasses(favTles, DEFAULT_OBS.lat, DEFAULT_OBS.lon, altKm, 7, 120, 10);
+    passes = (raw as Pass[]).sort((a, b) => b.maxEl - a.maxEl);
+    console.log(`[passAgent] favourites mode: ${favTles.length} TLEs matched, ${passes.length} passes found`);
+  } else {
+    passes = await getAllStarlinkPasses(DEFAULT_OBS);
+  }
+
   const now          = Math.floor(Date.now() / 1000);
   const windowSecs   = alertConfig.alertMinutesBefore * 60;
   const reminderSecs = 2 * 60;
   const alerts: NotificationAlert[] = [];
 
   for (const pass of passes) {
-    if (pass.maxEl < alertConfig.minElevation) continue;
+    // In standard mode: skip passes below elevation threshold
+    if (!isFavMode && pass.maxEl < alertConfig.minElevation) continue;
     if (pass.startUTC <= now) continue;
 
     const secsAway    = pass.startUTC - now;
     const minutesAway = Math.max(1, Math.round(secsAway / 60));
-    const initKey     = `${pass.startUTC}`;
-    const reminderKey = `${pass.startUTC}-r`;
+    const initKey     = `${pass.startUTC}-${pass.satname}`;
+    const reminderKey = `${pass.startUTC}-${pass.satname}-r`;
 
     // Initial alert
     if (secsAway <= windowSecs && !notifiedPasses.has(initKey)) {
       notifiedPasses.add(initKey);
       try {
-        await sendNtfy(pass, minutesAway);
-        console.log(`[ntfy] initial alert: ${pass.satname} in ${minutesAway}min`);
+        await sendNtfy(pass, minutesAway, isFavMode);
+        console.log(`[ntfy] initial alert: ${pass.satname} in ${minutesAway}min (fav=${isFavMode})`);
       } catch (err: any) {
         console.error('[ntfy] push failed:', err.message);
       }
@@ -271,8 +296,8 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
     ) {
       notifiedPasses.add(reminderKey);
       try {
-        await sendNtfy(pass, minutesAway);
-        console.log(`[ntfy] 2-min reminder: ${pass.satname}`);
+        await sendNtfy(pass, minutesAway, isFavMode);
+        console.log(`[ntfy] 2-min reminder: ${pass.satname} (fav=${isFavMode})`);
       } catch (err: any) {
         console.error('[ntfy] reminder push failed:', err.message);
       }

@@ -278,13 +278,23 @@ app.get('/api/notifications/settings', (_req, res) => {
 });
 
 app.post('/api/notifications/settings', (req: Request, res: Response) => {
-  const { minElevation, alertMinutesBefore, enabled } = req.body;
+  const { minElevation, alertMinutesBefore, enabled, favouriteSatellitesOnly, favouriteSatelliteNames } = req.body;
   const updated = setAlertConfig({
-    ...(typeof minElevation       === 'number'  && { minElevation }),
-    ...(typeof alertMinutesBefore === 'number'  && { alertMinutesBefore }),
-    ...(typeof enabled            === 'boolean' && { enabled }),
+    ...(typeof minElevation              === 'number'  && { minElevation }),
+    ...(typeof alertMinutesBefore        === 'number'  && { alertMinutesBefore }),
+    ...(typeof enabled                   === 'boolean' && { enabled }),
+    ...(typeof favouriteSatellitesOnly   === 'boolean' && { favouriteSatellitesOnly }),
+    ...(Array.isArray(favouriteSatelliteNames)         && { favouriteSatelliteNames }),
   });
   res.json(updated);
+});
+
+app.post('/api/notifications/favourites', (req: Request, res: Response) => {
+  const { satelliteNames } = req.body;
+  if (!Array.isArray(satelliteNames)) { res.status(400).json({ error: 'satelliteNames must be an array' }); return; }
+  const updated = setAlertConfig({ favouriteSatelliteNames: satelliteNames });
+  console.log(`[favourites] synced ${satelliteNames.length} favourite satellite names to alert config`);
+  res.json({ saved: true, count: satelliteNames.length, config: updated });
 });
 
 app.get('/api/digest/send-now', async (_req, res) => {
