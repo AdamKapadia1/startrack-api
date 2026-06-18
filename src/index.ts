@@ -982,6 +982,106 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
   }
 });
 
+// ── ISS info ──────────────────────────────────────────────────────────────────
+
+const NASA_ISS_IMAGES = [
+  'https://images-assets.nasa.gov/image/iss056e000236/iss056e000236~large.jpg',
+  'https://images-assets.nasa.gov/image/iss047e093413/iss047e093413~large.jpg',
+  'https://images-assets.nasa.gov/image/iss064e026035/iss064e026035~large.jpg',
+  'https://images-assets.nasa.gov/image/iss063e040872/iss063e040872~large.jpg',
+  'https://images-assets.nasa.gov/image/iss060e027826/iss060e027826~large.jpg',
+];
+
+app.get('/api/iss/info', async (req: Request, res: Response) => {
+  try {
+    await getActiveSatellites(1);
+    const allTles = getAllSatellites();
+    const issTle  = allTles.find(t =>
+      t.constellation === 'iss' &&
+      (t.name.toUpperCase().includes('ISS') || t.name.toUpperCase().includes('ZARYA'))
+    ) ?? allTles.find(t => t.constellation === 'iss');
+
+    const { lat, lon, altM } = parseObs(req);
+
+    // ── Crew from Open Notify ──────────────────────────────────────────────────
+    let crew: string[] = [];
+    try {
+      const crewRes = await axios.get('http://api.open-notify.org/astros.json', { timeout: 6_000 });
+      crew = (crewRes.data.people as any[])
+        .filter(p => p.craft === 'ISS')
+        .map(p => p.name as string);
+    } catch { /* leave crew empty — not critical */ }
+
+    // ── SGP4 position + speed ──────────────────────────────────────────────────
+    let altitudeKm:  number | null = null;
+    let speedKmS:    number | null = null;
+    let currentLat:  number | null = null;
+    let currentLon:  number | null = null;
+
+    if (issTle) {
+      try {
+        const sr  = satelliteJs.twoline2satrec(issTle.line1, issTle.line2);
+        const now = new Date();
+        const pv  = satelliteJs.propagate(sr, now);
+        const pos = (pv as any)?.position;
+        const vel = (pv as any)?.velocity;
+
+        if (pos && pos !== false) {
+          const gmst = satelliteJs.gstime(now);
+          const geo  = satelliteJs.eciToGeodetic(pos, gmst);
+          altitudeKm = Math.round(geo.height);
+          currentLat = Math.round(satelliteJs.degreesLat(geo.latitude)  * 100) / 100;
+          currentLon = Math.round(satelliteJs.degreesLong(geo.longitude) * 100) / 100;
+        }
+
+        if (vel && vel !== false) {
+          const v = vel as any;
+          speedKmS = Math.round(Math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2) * 10) / 10;
+        }
+      } catch { /* skip telemetry */ }
+    }
+
+    // ── Next pass ──────────────────────────────────────────────────────────────
+    let nextPass: object | null = null;
+    if (issTle) {
+      try {
+        const passes = predictPasses([issTle], lat, lon, altM / 1000, 3, 60, 10)
+          .sort((a, b) => a.startUTC - b.startUTC);
+        if (passes.length > 0) {
+          const p  = passes[0];
+          nextPass = {
+            startUTC: p.startUTC,
+            maxUTC:   p.maxUTC,
+            endUTC:   p.endUTC,
+            maxEl:    Math.round(p.maxEl),
+            duration: p.duration,
+          };
+        }
+      } catch { /* skip pass */ }
+    }
+
+    // ── NASA image (live fetch with hardcoded fallback) ────────────────────────
+    let nasaImageUrl = NASA_ISS_IMAGES[Math.floor(Math.random() * NASA_ISS_IMAGES.length)];
+    try {
+      const imgRes = await axios.get(
+        'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20',
+        { timeout: 5_000 },
+      );
+      const items = (imgRes.data?.collection?.items ?? []) as any[];
+      const withLinks = items.filter(i => i.links?.[0]?.href);
+      if (withLinks.length > 0) {
+        nasaImageUrl = withLinks[Math.floor(Math.random() * Math.min(withLinks.length, 10))].links[0].href;
+      }
+    } catch { /* use hardcoded fallback */ }
+
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl });
+  } catch (err: any) {
+    console.error('[iss] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Daily digest state ────────────────────────────────────────────────────────
 let lastDigestDate:     string | null = null;
 let lastValidationDate: string | null = null;
