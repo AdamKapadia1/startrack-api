@@ -984,13 +984,39 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
 
 // ── ISS info ──────────────────────────────────────────────────────────────────
 
-const NASA_ISS_IMAGES = [
+const NASA_ISS_PHOTO_FALLBACKS = [
   'https://images-assets.nasa.gov/image/iss054e004111/iss054e004111~medium.jpg',
   'https://images-assets.nasa.gov/image/iss054e004116/iss054e004116~medium.jpg',
   'https://images-assets.nasa.gov/image/iss021e030674/iss021e030674~medium.jpg',
   'https://images-assets.nasa.gov/image/iss021e030599/iss021e030599~medium.jpg',
   'https://images-assets.nasa.gov/image/s129e007221/s129e007221~medium.jpg',
 ];
+
+// Proxy endpoint — browser never hits NASA CDN directly
+app.get('/api/iss/photo', async (_req: Request, res: Response) => {
+  let imgUrl = NASA_ISS_PHOTO_FALLBACKS[Math.floor(Math.random() * NASA_ISS_PHOTO_FALLBACKS.length)];
+  try {
+    const search = await axios.get(
+      'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20',
+      { timeout: 5_000 },
+    );
+    const items = (search.data?.collection?.items ?? []) as any[];
+    const valid = items.filter((i: any) => i.links?.[0]?.href);
+    if (valid.length > 0) {
+      imgUrl = valid[Math.floor(Math.random() * Math.min(valid.length, 10))].links[0].href;
+    }
+  } catch { /* use fallback */ }
+
+  try {
+    const img = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 8_000 });
+    res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(img.data);
+  } catch {
+    // Last-resort: redirect to a known-good fallback rather than fail
+    res.redirect(302, NASA_ISS_PHOTO_FALLBACKS[0]);
+  }
+});
 
 app.get('/api/iss/info', async (req: Request, res: Response) => {
   try {
@@ -1060,19 +1086,8 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
       } catch { /* skip pass */ }
     }
 
-    // ── NASA image (live fetch with hardcoded fallback) ────────────────────────
-    let nasaImageUrl = NASA_ISS_IMAGES[Math.floor(Math.random() * NASA_ISS_IMAGES.length)];
-    try {
-      const imgRes = await axios.get(
-        'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20',
-        { timeout: 5_000 },
-      );
-      const items = (imgRes.data?.collection?.items ?? []) as any[];
-      const withLinks = items.filter(i => i.links?.[0]?.href);
-      if (withLinks.length > 0) {
-        nasaImageUrl = withLinks[Math.floor(Math.random() * Math.min(withLinks.length, 10))].links[0].href;
-      }
-    } catch { /* use hardcoded fallback */ }
+    // Return a stable proxy URL — browser hits Railway, Railway hits NASA
+    const nasaImageUrl = '/api/iss/photo';
 
     res.set('Cache-Control', 'public, max-age=60');
     res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl });
