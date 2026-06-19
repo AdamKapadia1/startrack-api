@@ -1008,7 +1008,15 @@ app.get('/api/satellites/groundtrack', async (req, res) => {
     }
 });
 // ── ISS info ──────────────────────────────────────────────────────────────────
-// Verified 200-OK exterior ISS photos — randomly selected per request, proxied through Railway
+// User-specified exterior ISS asset IDs — tried first via NASA Image Library manifest
+const ISS_EXTERIOR_ASSETS = [
+    'iss040e013377',
+    'iss040e013376',
+    'iss040e013378',
+    'iss025e013923',
+    'iss024e005949',
+];
+// Verified 200-OK CDN URLs used as fallback when manifest assets fail
 const ISS_VERIFIED_PHOTOS = [
     'https://images-assets.nasa.gov/image/iss074e0403089/iss074e0403089~large.jpg',
     'https://images-assets.nasa.gov/image/iss073e0982217/iss073e0982217~large.jpg',
@@ -1020,52 +1028,80 @@ const ISS_VERIFIED_PHOTOS = [
     'https://images-assets.nasa.gov/image/iss059e035608/iss059e035608~large.jpg',
     'https://images-assets.nasa.gov/image/iss058e007453/iss058e007453~large.jpg',
 ];
-// Proxy endpoint — browser hits Railway, Railway fetches from NASA CDN
+let lastServedAssetId = null;
+// Proxy endpoint — tries asset manifest first, falls back to verified CDN list
 app.get('/api/iss/photo', async (_req, res) => {
-    const idx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
-    const imgUrl = ISS_VERIFIED_PHOTOS[idx];
-    try {
-        const img = await axios_1.default.get(imgUrl, { responseType: 'arraybuffer', timeout: 10000 });
-        res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
-        res.set('Cache-Control', 'no-cache');
-        res.send(img.data);
-    }
-    catch {
-        const fallback = ISS_VERIFIED_PHOTOS[(idx + 1) % ISS_VERIFIED_PHOTOS.length];
+    // Attempt each user-specified asset ID via the NASA Image Library manifest
+    for (const assetId of ISS_EXTERIOR_ASSETS) {
         try {
-            const img = await axios_1.default.get(fallback, { responseType: 'arraybuffer', timeout: 10000 });
+            const manifest = await axios_1.default.get(`https://images-api.nasa.gov/asset/${assetId}`, { timeout: 8000 });
+            const items = manifest.data?.collection?.items ?? [];
+            const imageHref = items.find(i => i.href?.endsWith('~large.jpg'))?.href
+                ?? items.find(i => i.href?.endsWith('~medium.jpg'))?.href;
+            if (imageHref) {
+                const img = await axios_1.default.get(imageHref, { responseType: 'arraybuffer', timeout: 12000 });
+                res.set('Content-Type', 'image/jpeg');
+                res.set('Cache-Control', 'no-cache');
+                res.set('X-Asset-Id', assetId);
+                lastServedAssetId = assetId;
+                console.log(`[iss/photo] served manifest asset ${assetId}`);
+                res.send(img.data);
+                return;
+            }
+        }
+        catch (err) {
+            console.warn(`[iss/photo] manifest ${assetId} failed: ${err.message}`);
+        }
+    }
+    // Fallback: rotate through verified CDN URLs
+    lastServedAssetId = null;
+    const idx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
+    for (let i = 0; i < ISS_VERIFIED_PHOTOS.length; i++) {
+        const url = ISS_VERIFIED_PHOTOS[(idx + i) % ISS_VERIFIED_PHOTOS.length];
+        try {
+            const img = await axios_1.default.get(url, { responseType: 'arraybuffer', timeout: 10000 });
             res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
             res.set('Cache-Control', 'no-cache');
             res.send(img.data);
+            return;
         }
-        catch {
-            res.status(503).json({ error: 'photo unavailable' });
-        }
+        catch { /* try next */ }
     }
+    res.status(503).json({ error: 'photo unavailable' });
 });
 app.get('/api/iss/track', async (_req, res) => {
     if (!issTleData) {
-        res.json({ points: [] });
+        res.json({ past: [], future: [] });
         return;
     }
     try {
         const satrec = satelliteJs.twoline2satrec(issTleData.line1, issTleData.line2);
-        const points = [];
         const now = new Date();
-        for (let i = 0; i <= 30; i++) {
-            const t = new Date(now.getTime() + i * 60000);
+        function getPos(t) {
             const pv = satelliteJs.propagate(satrec, t);
-            if (pv && pv.position && typeof pv.position !== 'boolean') {
-                const gmst = satelliteJs.gstime(t);
-                const geo = satelliteJs.eciToGeodetic(pv.position, gmst);
-                points.push({
-                    lat: parseFloat(satelliteJs.degreesLat(geo.latitude).toFixed(2)),
-                    lon: parseFloat(satelliteJs.degreesLong(geo.longitude).toFixed(2)),
-                });
-            }
+            if (!pv || !pv.position || typeof pv.position === 'boolean')
+                return null;
+            const gmst = satelliteJs.gstime(t);
+            const geo = satelliteJs.eciToGeodetic(pv.position, gmst);
+            return {
+                lat: parseFloat(satelliteJs.degreesLat(geo.latitude).toFixed(2)),
+                lon: parseFloat(satelliteJs.degreesLong(geo.longitude).toFixed(2)),
+            };
+        }
+        const past = [];
+        const future = [];
+        for (let i = 5; i >= 1; i--) {
+            const p = getPos(new Date(now.getTime() - i * 60000));
+            if (p)
+                past.push(p);
+        }
+        for (let i = 0; i <= 20; i++) {
+            const p = getPos(new Date(now.getTime() + i * 60000));
+            if (p)
+                future.push(p);
         }
         res.set('Cache-Control', 'public, max-age=30');
-        res.json({ points });
+        res.json({ past, future });
     }
     catch (err) {
         res.status(500).json({ error: err.message });
@@ -1084,9 +1120,9 @@ app.get('/api/iss/info', async (req, res) => {
                 .map(p => p.name);
         }
         catch { /* leave crew empty — not critical */ }
-        // ── Photo — always served via Railway proxy (verified CDN URLs) ────────────
+        // ── Photo — always served via Railway proxy (asset manifest or CDN fallback)
         const nasaImageUrl = `${RAILWAY_URL}/api/iss/photo`;
-        const nasaImageTitle = 'ISS exterior — NASA';
+        const nasaImageTitle = lastServedAssetId ? `NASA/JSC — ${lastServedAssetId}` : 'ISS exterior — NASA';
         console.log('[iss] photo URL:', nasaImageUrl);
         // ── SGP4 position + speed (uses dedicated issTleData, NORAD 25544) ─────────
         let altitudeKm = null;
