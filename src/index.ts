@@ -18,6 +18,10 @@ import type { HorizonProfile } from './utils/horizonProfile.js';
 
 dotenv.config();
 
+const RAILWAY_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : 'https://web-production-98c0d.up.railway.app';
+
 const DEFAULT_LAT   = 51.7957;
 const DEFAULT_LON   = -0.6572;
 const DEFAULT_ALT_M = 148;
@@ -1038,24 +1042,21 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
         .map(p => p.name as string);
     } catch { /* leave crew empty — not critical */ }
 
-    // ── NASA Image and Video Library (free, no key) ────────────────────────────
-    let nasaImage: string | null = null;
+    // ── NASA image — served via Railway proxy, title fetched for credit ──────────
+    // Image is always available via the proxy; we fetch the title separately.
+    const nasaImageUrl = `${RAILWAY_URL}/api/iss/photo`;
     let nasaImageTitle: string | null = null;
     try {
       const nasaRes = await axios.get(
-        'https://images-api.nasa.gov/search?q=ISS+exterior+orbit&media_type=image&year_start=2020&page_size=20',
-        { timeout: 8_000 },
+        'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&year_start=2020&page_size=20',
+        { timeout: 5_000 },
       );
       const items: any[] = nasaRes.data?.collection?.items ?? [];
       if (items.length > 0) {
         const dayIndex = new Date().getDate() % items.length;
-        const item = items[dayIndex];
-        nasaImage = item?.links?.[0]?.href || null;
-        nasaImageTitle = item?.data?.[0]?.title || null;
+        nasaImageTitle = items[dayIndex]?.data?.[0]?.title || null;
       }
-    } catch { /* use null */ }
-    console.log('[iss] NASA image URL:', nasaImage);
-    console.log('[iss] NASA image title:', nasaImageTitle);
+    } catch { /* title stays null */ }
 
     // ── SGP4 position + speed ──────────────────────────────────────────────────
     let altitudeKm:  number | null = null;
@@ -1106,7 +1107,7 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
     }
 
     res.set('Cache-Control', 'public, max-age=60');
-    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl: nasaImage, nasaImageTitle });
+    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl, nasaImageTitle });
   } catch (err: any) {
     console.error('[iss] error:', err.message);
     res.status(500).json({ error: err.message });
@@ -1266,13 +1267,9 @@ server.listen(Number(PORT), '0.0.0.0', () => {
   }
 
   // Keep Railway awake — ping /health every 4 min so the dyno never sleeps
-  const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
-    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-    : 'https://web-production-98c0d.up.railway.app';
-
   setInterval(async () => {
     try {
-      await axios.get(`${BACKEND_URL}/health`, { timeout: 5_000 });
+      await axios.get(`${RAILWAY_URL}/health`, { timeout: 5_000 });
       console.log('[keep-alive] ping sent');
     } catch (err: any) {
       console.warn('[keep-alive] ping failed:', err.message);
