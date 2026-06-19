@@ -22,6 +22,28 @@ const RAILWAY_URL = process.env.RAILWAY_PUBLIC_DOMAIN
   ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
   : 'https://web-production-98c0d.up.railway.app';
 
+// ── ISS TLE — dedicated fetch using NORAD ID 25544, refreshed every 6 h ───────
+let issTleData: { name: string; line1: string; line2: string } | null = null;
+
+async function fetchIssTle(): Promise<void> {
+  try {
+    const res = await axios.get(
+      'https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle',
+      { timeout: 10_000 },
+    );
+    const lines = (res.data as string).trim().split('\n');
+    if (lines.length >= 3) {
+      issTleData = { name: lines[0].trim(), line1: lines[1].trim(), line2: lines[2].trim() };
+      console.log('[iss] TLE fetched:', issTleData.name);
+    }
+  } catch (err: any) {
+    console.error('[iss] TLE fetch failed:', err.message);
+  }
+}
+
+fetchIssTle();
+setInterval(fetchIssTle, 6 * 60 * 60 * 1_000);
+
 const DEFAULT_LAT   = 51.7957;
 const DEFAULT_LON   = -0.6572;
 const DEFAULT_ALT_M = 148;
@@ -988,50 +1010,35 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
 
 // ── ISS info ──────────────────────────────────────────────────────────────────
 
-const NASA_ISS_PHOTO_FALLBACKS = [
+// Verified 200-OK exterior ISS photos — rotates daily, proxied through Railway
+const ISS_VERIFIED_PHOTOS = [
+  'https://images-assets.nasa.gov/image/iss074e0403089/iss074e0403089~large.jpg',
+  'https://images-assets.nasa.gov/image/iss072e576465/iss072e576465~medium.jpg',
+  'https://images-assets.nasa.gov/image/iss061e006843/iss061e006843~medium.jpg',
+  'https://images-assets.nasa.gov/image/iss048e050816/iss048e050816~medium.jpg',
   'https://images-assets.nasa.gov/image/iss054e004111/iss054e004111~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss054e004116/iss054e004116~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss021e030674/iss021e030674~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss021e030599/iss021e030599~medium.jpg',
-  'https://images-assets.nasa.gov/image/s129e007221/s129e007221~medium.jpg',
 ];
 
-// Proxy endpoint — browser never hits NASA CDN directly
+// Proxy endpoint — browser hits Railway, Railway fetches from NASA CDN
 app.get('/api/iss/photo', async (_req: Request, res: Response) => {
-  let imgUrl = NASA_ISS_PHOTO_FALLBACKS[Math.floor(Math.random() * NASA_ISS_PHOTO_FALLBACKS.length)];
+  const dayIndex = new Date().getDate() % ISS_VERIFIED_PHOTOS.length;
+  const imgUrl   = ISS_VERIFIED_PHOTOS[dayIndex];
   try {
-    const search = await axios.get(
-      'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&page_size=20',
-      { timeout: 5_000 },
-    );
-    const items = (search.data?.collection?.items ?? []) as any[];
-    const valid = items.filter((i: any) => i.links?.[0]?.href);
-    if (valid.length > 0) {
-      imgUrl = valid[Math.floor(Math.random() * Math.min(valid.length, 10))].links[0].href;
-    }
-  } catch { /* use fallback */ }
-
-  try {
-    const img = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 8_000 });
-    res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
+    const img = await axios.get(imgUrl, { responseType: 'arraybuffer', timeout: 10_000 });
+    res.set('Content-Type',  String(img.headers['content-type'] ?? 'image/jpeg'));
     res.set('Cache-Control', 'public, max-age=3600');
     res.send(img.data);
   } catch {
-    // Last-resort: redirect to a known-good fallback rather than fail
-    res.redirect(302, NASA_ISS_PHOTO_FALLBACKS[0]);
+    const fallback = ISS_VERIFIED_PHOTOS[(dayIndex + 1) % ISS_VERIFIED_PHOTOS.length];
+    res.redirect(302, fallback);
   }
 });
 
 app.get('/api/iss/info', async (req: Request, res: Response) => {
   try {
-    await getActiveSatellites(1);
-    const allTles = getAllSatellites();
-    const issTle  = allTles.find(t =>
-      t.constellation === 'iss' &&
-      (t.name.toUpperCase().includes('ISS') || t.name.toUpperCase().includes('ZARYA'))
-    ) ?? allTles.find(t => t.constellation === 'iss');
-
     const { lat, lon, altM } = parseObs(req);
+
+    console.log('[iss] using TLE:', issTleData?.name ?? '(not yet fetched)');
 
     // ── Crew from Open Notify ──────────────────────────────────────────────────
     let crew: string[] = [];
@@ -1042,66 +1049,54 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
         .map(p => p.name as string);
     } catch { /* leave crew empty — not critical */ }
 
-    // ── NASA image — served via Railway proxy, title fetched for credit ──────────
-    // Image is always available via the proxy; we fetch the title separately.
-    const nasaImageUrl = `${RAILWAY_URL}/api/iss/photo`;
-    let nasaImageTitle: string | null = null;
-    try {
-      const nasaRes = await axios.get(
-        'https://images-api.nasa.gov/search?q=international+space+station+exterior&media_type=image&year_start=2020&page_size=20',
-        { timeout: 5_000 },
-      );
-      const items: any[] = nasaRes.data?.collection?.items ?? [];
-      if (items.length > 0) {
-        const dayIndex = new Date().getDate() % items.length;
-        nasaImageTitle = items[dayIndex]?.data?.[0]?.title || null;
-      }
-    } catch { /* title stays null */ }
+    // ── Photo — always served via Railway proxy (verified CDN URLs) ────────────
+    const nasaImageUrl   = `${RAILWAY_URL}/api/iss/photo`;
+    const nasaImageTitle = 'ISS exterior — NASA';
+    console.log('[iss] photo URL:', nasaImageUrl);
 
-    // ── SGP4 position + speed ──────────────────────────────────────────────────
-    let altitudeKm:  number | null = null;
-    let speedKmS:    number | null = null;
-    let currentLat:  number | null = null;
-    let currentLon:  number | null = null;
+    // ── SGP4 position + speed (uses dedicated issTleData, NORAD 25544) ─────────
+    let altitudeKm: number | null = null;
+    let speedKmS:   number | null = null;
+    let currentLat: number | null = null;
+    let currentLon: number | null = null;
 
-    if (issTle) {
+    if (issTleData) {
       try {
-        const sr  = satelliteJs.twoline2satrec(issTle.line1, issTle.line2);
-        const now = new Date();
-        const pv  = satelliteJs.propagate(sr, now);
-        const pos = (pv as any)?.position;
-        const vel = (pv as any)?.velocity;
+        const satrec = satelliteJs.twoline2satrec(issTleData.line1, issTleData.line2);
+        const now    = new Date();
+        const pv     = satelliteJs.propagate(satrec, now);
 
-        if (pos && pos !== false) {
+        if (pv && pv.position && typeof pv.position !== 'boolean') {
           const gmst = satelliteJs.gstime(now);
-          const geo  = satelliteJs.eciToGeodetic(pos, gmst);
+          const geo  = satelliteJs.eciToGeodetic(
+            pv.position as satelliteJs.EciVec3<number>,
+            gmst,
+          );
           altitudeKm = Math.round(geo.height);
           currentLat = Math.round(satelliteJs.degreesLat(geo.latitude)  * 100) / 100;
           currentLon = Math.round(satelliteJs.degreesLong(geo.longitude) * 100) / 100;
         }
 
-        if (vel && vel !== false) {
-          const v = vel as any;
+        if (pv && pv.velocity && typeof pv.velocity !== 'boolean') {
+          const v  = pv.velocity as satelliteJs.EciVec3<number>;
           speedKmS = Math.round(Math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2) * 10) / 10;
         }
-      } catch { /* skip telemetry */ }
+      } catch (e: any) {
+        console.error('[iss] SGP4 error:', e.message);
+      }
     }
 
-    // ── Next pass ──────────────────────────────────────────────────────────────
+    // ── Next pass (uses issTleData formatted as a TLE cache entry) ─────────────
     let nextPass: object | null = null;
-    if (issTle) {
+    if (issTleData) {
       try {
-        const passes = predictPasses([issTle], lat, lon, altM / 1000, 3, 60, 10)
+        const noradId = parseInt(issTleData.line1.substring(2, 7).trim(), 10);
+        const tleLike = { name: issTleData.name, noradId, line1: issTleData.line1, line2: issTleData.line2, constellation: 'iss' as const };
+        const passes  = predictPasses([tleLike], lat, lon, altM / 1000, 3, 60, 10)
           .sort((a, b) => a.startUTC - b.startUTC);
         if (passes.length > 0) {
-          const p  = passes[0];
-          nextPass = {
-            startUTC: p.startUTC,
-            maxUTC:   p.maxUTC,
-            endUTC:   p.endUTC,
-            maxEl:    Math.round(p.maxEl),
-            duration: p.duration,
-          };
+          const p = passes[0];
+          nextPass = { startUTC: p.startUTC, maxUTC: p.maxUTC, endUTC: p.endUTC, maxEl: Math.round(p.maxEl), duration: p.duration };
         }
       } catch { /* skip pass */ }
     }
