@@ -1008,27 +1008,39 @@ app.get('/api/satellites/groundtrack', async (req, res) => {
     }
 });
 // ── ISS info ──────────────────────────────────────────────────────────────────
-// Verified 200-OK exterior ISS photos — rotates daily, proxied through Railway
+// Verified 200-OK exterior ISS photos — randomly selected per request, proxied through Railway
 const ISS_VERIFIED_PHOTOS = [
     'https://images-assets.nasa.gov/image/iss074e0403089/iss074e0403089~large.jpg',
+    'https://images-assets.nasa.gov/image/iss073e0982217/iss073e0982217~large.jpg',
     'https://images-assets.nasa.gov/image/iss072e576465/iss072e576465~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss072e575553/iss072e575553~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss064e030164/iss064e030164~large.jpg',
     'https://images-assets.nasa.gov/image/iss061e006843/iss061e006843~medium.jpg',
-    'https://images-assets.nasa.gov/image/iss048e050816/iss048e050816~medium.jpg',
-    'https://images-assets.nasa.gov/image/iss054e004111/iss054e004111~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss061e006834/iss061e006834~medium.jpg',
+    'https://images-assets.nasa.gov/image/iss059e035608/iss059e035608~large.jpg',
+    'https://images-assets.nasa.gov/image/iss058e007453/iss058e007453~large.jpg',
 ];
 // Proxy endpoint — browser hits Railway, Railway fetches from NASA CDN
 app.get('/api/iss/photo', async (_req, res) => {
-    const dayIndex = new Date().getDate() % ISS_VERIFIED_PHOTOS.length;
-    const imgUrl = ISS_VERIFIED_PHOTOS[dayIndex];
+    const idx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
+    const imgUrl = ISS_VERIFIED_PHOTOS[idx];
     try {
         const img = await axios_1.default.get(imgUrl, { responseType: 'arraybuffer', timeout: 10000 });
         res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
-        res.set('Cache-Control', 'public, max-age=3600');
+        res.set('Cache-Control', 'no-cache');
         res.send(img.data);
     }
     catch {
-        const fallback = ISS_VERIFIED_PHOTOS[(dayIndex + 1) % ISS_VERIFIED_PHOTOS.length];
-        res.redirect(302, fallback);
+        const fallback = ISS_VERIFIED_PHOTOS[(idx + 1) % ISS_VERIFIED_PHOTOS.length];
+        try {
+            const img = await axios_1.default.get(fallback, { responseType: 'arraybuffer', timeout: 10000 });
+            res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
+            res.set('Cache-Control', 'no-cache');
+            res.send(img.data);
+        }
+        catch {
+            res.status(503).json({ error: 'photo unavailable' });
+        }
     }
 });
 app.get('/api/iss/info', async (req, res) => {
