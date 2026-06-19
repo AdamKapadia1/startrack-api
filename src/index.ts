@@ -1119,77 +1119,259 @@ app.get('/api/iss/track', async (_req: Request, res: Response) => {
   }
 });
 
+// ── ISS orbital computation helpers ──────────────────────────────────────────
+
+function dateToJD(d: Date): number {
+  return d.getTime() / 86400000 + 2440587.5;
+}
+
+function getSunDirECI(jd: number): { x: number; y: number; z: number } {
+  const n      = jd - 2451545.0;
+  const L      = (280.46 + 0.9856474 * n) * (Math.PI / 180);
+  const g      = (357.528 + 0.9856003 * n) * (Math.PI / 180);
+  const lambda = L + 1.915 * (Math.PI / 180) * Math.sin(g) + 0.02 * (Math.PI / 180) * Math.sin(2 * g);
+  const eps    = (23.439 - 0.0000004 * n) * (Math.PI / 180);
+  const x = Math.cos(lambda);
+  const y = Math.cos(eps) * Math.sin(lambda);
+  const z = Math.sin(eps) * Math.sin(lambda);
+  const mag = Math.sqrt(x * x + y * y + z * z);
+  return { x: x / mag, y: y / mag, z: z / mag };
+}
+
+function checkSunlit(
+  pos: { x: number; y: number; z: number },
+  sunDir: { x: number; y: number; z: number },
+): boolean {
+  const Re  = 6378.137;
+  const dot = pos.x * sunDir.x + pos.y * sunDir.y + pos.z * sunDir.z;
+  if (dot > 0) return true;
+  const px = pos.x - dot * sunDir.x;
+  const py = pos.y - dot * sunDir.y;
+  const pz = pos.z - dot * sunDir.z;
+  return Math.sqrt(px * px + py * py + pz * pz) > Re;
+}
+
+function calcBetaAngle(
+  pos: { x: number; y: number; z: number },
+  vel: { x: number; y: number; z: number },
+  sunDir: { x: number; y: number; z: number },
+): number {
+  const hx   = pos.y * vel.z - pos.z * vel.y;
+  const hy   = pos.z * vel.x - pos.x * vel.z;
+  const hz   = pos.x * vel.y - pos.y * vel.x;
+  const hmag = Math.sqrt(hx * hx + hy * hy + hz * hz);
+  const dot  = (hx * sunDir.x + hy * sunDir.y + hz * sunDir.z) / hmag;
+  return Math.asin(Math.max(-1, Math.min(1, dot))) * (180 / Math.PI);
+}
+
+function getLookAt(
+  satrec: ReturnType<typeof satelliteJs.twoline2satrec>,
+  t: Date,
+  obsGd: { latitude: number; longitude: number; height: number },
+): { az: number; el: number; range: number } | null {
+  const pv = satelliteJs.propagate(satrec, t);
+  if (!pv || !pv.position || typeof pv.position === 'boolean') return null;
+  const gmst   = satelliteJs.gstime(t);
+  const posEcf = satelliteJs.eciToEcf(pv.position as satelliteJs.EciVec3<number>, gmst);
+  const la     = (satelliteJs as any).ecfToLookAngles(obsGd, posEcf) as { azimuth: number; elevation: number; rangeSat: number };
+  return { az: la.azimuth * (180 / Math.PI), el: la.elevation * (180 / Math.PI), range: la.rangeSat };
+}
+
+function getRangeRate(
+  satrec: ReturnType<typeof satelliteJs.twoline2satrec>,
+  t: Date,
+  obsGd: { latitude: number; longitude: number; height: number },
+): number {
+  const DT  = 5000;
+  const la0 = getLookAt(satrec, new Date(t.getTime() - DT), obsGd);
+  const la1 = getLookAt(satrec, new Date(t.getTime() + DT), obsGd);
+  if (!la0 || !la1) return 0;
+  return (la1.range - la0.range) / (2 * DT / 1000);
+}
+
+// ── /api/iss/info ─────────────────────────────────────────────────────────────
+
 app.get('/api/iss/info', async (req: Request, res: Response) => {
   try {
     const { lat, lon, altM } = parseObs(req);
+    const now = new Date();
+    const jd  = dateToJD(now);
 
-    console.log('[iss] using TLE:', issTleData?.name ?? '(not yet fetched)');
+    // Kick off slow crew fetch; all TLE math runs while it's in-flight
+    const crewPromise = axios.get('http://api.open-notify.org/astros.json', { timeout: 6_000 }).catch(() => null);
 
-    // ── Crew from Open Notify ──────────────────────────────────────────────────
-    let crew: string[] = [];
-    try {
-      const crewRes = await axios.get('http://api.open-notify.org/astros.json', { timeout: 6_000 });
-      crew = (crewRes.data.people as any[])
-        .filter(p => p.craft === 'ISS')
-        .map(p => p.name as string);
-    } catch { /* leave crew empty — not critical */ }
-
-    // ── Photo — always served via Railway proxy (asset manifest or CDN fallback)
     const nasaImageUrl   = `${RAILWAY_URL}/api/iss/photo`;
     const nasaImageTitle = lastServedAssetId ? `NASA/JSC — ${lastServedAssetId}` : 'ISS exterior — NASA';
-    console.log('[iss] photo URL:', nasaImageUrl);
 
-    // ── SGP4 position + speed (uses dedicated issTleData, NORAD 25544) ─────────
-    let altitudeKm: number | null = null;
-    let speedKmS:   number | null = null;
-    let currentLat: number | null = null;
-    let currentLon: number | null = null;
+    // Defaults
+    let altitudeKm: number | null = null, speedKmS: number | null = null;
+    let currentLat: number | null = null, currentLon: number | null = null;
+    let eciPosX = 0, eciPosY = 0, eciPosZ = 0;
+    let eciVelX = 0, eciVelY = 0, eciVelZ = 0;
+    let inclinationDeg = 0, raanDeg = 0, eccentricity = 0, argPerigeeDeg = 0;
+    let meanAnomalyDeg = 0, meanMotionRevDay = 0, bstar = 0, elementSet = 0, revNumber = 0;
+    let smaKm = 0, apogeeKm = 0, perigeeKm = 0, periodMin = 0;
+    let solarStatus: 'SUNLIT' | 'ECLIPSE' = 'SUNLIT';
+    let timeToTransitionSecs: number | null = null;
+    let betaAngleDeg = 0;
+    let tleEpochUTC = '', tleAgeHours = 0;
+    let tleLine1 = '', tleLine2 = '';
+    let nextPasses: object[] = [], passDetails: object[] = [];
 
     if (issTleData) {
       try {
+        tleLine1 = issTleData.line1;
+        tleLine2 = issTleData.line2;
+
         const satrec = satelliteJs.twoline2satrec(issTleData.line1, issTleData.line2);
-        const now    = new Date();
-        const pv     = satelliteJs.propagate(satrec, now);
+        const sr     = satrec as any;
+
+        // ── State vector at current epoch ──────────────────────────────────
+        const pv = satelliteJs.propagate(satrec, now);
 
         if (pv && pv.position && typeof pv.position !== 'boolean') {
           const gmst = satelliteJs.gstime(now);
-          const geo  = satelliteJs.eciToGeodetic(
-            pv.position as satelliteJs.EciVec3<number>,
-            gmst,
-          );
+          const geo  = satelliteJs.eciToGeodetic(pv.position as satelliteJs.EciVec3<number>, gmst);
           altitudeKm = Math.round(geo.height);
           currentLat = Math.round(satelliteJs.degreesLat(geo.latitude)  * 100) / 100;
           currentLon = Math.round(satelliteJs.degreesLong(geo.longitude) * 100) / 100;
+          const p = pv.position as satelliteJs.EciVec3<number>;
+          eciPosX = Math.round(p.x * 10) / 10;
+          eciPosY = Math.round(p.y * 10) / 10;
+          eciPosZ = Math.round(p.z * 10) / 10;
         }
 
         if (pv && pv.velocity && typeof pv.velocity !== 'boolean') {
           const v  = pv.velocity as satelliteJs.EciVec3<number>;
           speedKmS = Math.round(Math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2) * 10) / 10;
+          eciVelX  = Math.round(v.x * 10000) / 10000;
+          eciVelY  = Math.round(v.y * 10000) / 10000;
+          eciVelZ  = Math.round(v.z * 10000) / 10000;
         }
-      } catch (e: any) {
-        console.error('[iss] SGP4 error:', e.message);
-      }
-    }
 
-    // ── All passes in next 24 h (uses issTleData, min 5°) ─────────────────────
-    let nextPasses: object[] = [];
-    if (issTleData) {
-      try {
+        // ── Keplerian elements direct from satrec ──────────────────────────
+        inclinationDeg   = sr.inclo    * (180 / Math.PI);
+        raanDeg          = sr.nodeo    * (180 / Math.PI);
+        eccentricity     = sr.ecco;
+        argPerigeeDeg    = sr.argpo    * (180 / Math.PI);
+        meanAnomalyDeg   = sr.mo       * (180 / Math.PI);
+        meanMotionRevDay = sr.no_kozai * (1440 / (2 * Math.PI));
+        bstar            = sr.bstar;
+        elementSet       = sr.elnum  ?? 0;
+        revNumber        = sr.revnum ?? 0;
+
+        // ── Derived orbital parameters ─────────────────────────────────────
+        const mu     = 3.986004418e5;
+        const n_rads = sr.no_kozai / 60;
+        smaKm     = Math.pow(mu / (n_rads * n_rads), 1 / 3);
+        const Re  = 6378.137;
+        apogeeKm  = smaKm * (1 + eccentricity) - Re;
+        perigeeKm = smaKm * (1 - eccentricity) - Re;
+        periodMin = (2 * Math.PI) / sr.no_kozai;
+
+        // ── TLE epoch + age ────────────────────────────────────────────────
+        const epochYr   = sr.epochyr   as number;
+        const epochDays = sr.epochdays as number;
+        const year      = epochYr < 57 ? 2000 + epochYr : 1900 + epochYr;
+        const epochDate = new Date(Date.UTC(year, 0, 1));
+        epochDate.setTime(epochDate.getTime() + (epochDays - 1) * 86400000);
+        tleEpochUTC = epochDate.toISOString();
+        tleAgeHours = (now.getTime() - epochDate.getTime()) / 3_600_000;
+
+        // ── Solar illumination + beta angle ────────────────────────────────
+        const sunDir = getSunDirECI(jd);
+
+        if (pv && pv.position && typeof pv.position !== 'boolean' &&
+            pv && pv.velocity && typeof pv.velocity !== 'boolean') {
+          const pos = pv.position as satelliteJs.EciVec3<number>;
+          const vel = pv.velocity as satelliteJs.EciVec3<number>;
+          const sunlit = checkSunlit(pos, sunDir);
+          solarStatus  = sunlit ? 'SUNLIT' : 'ECLIPSE';
+          betaAngleDeg = calcBetaAngle(pos, vel, sunDir);
+
+          // Sample every 60 s for up to 12 h to find next illumination change
+          for (let i = 1; i <= 720; i++) {
+            const tS  = new Date(now.getTime() + i * 60_000);
+            const pvS = satelliteJs.propagate(satrec, tS);
+            if (!pvS || !pvS.position || typeof pvS.position === 'boolean') continue;
+            const sunlitS = checkSunlit(pvS.position as satelliteJs.EciVec3<number>, getSunDirECI(dateToJD(tS)));
+            if (sunlitS !== sunlit) { timeToTransitionSecs = i * 60; break; }
+          }
+        }
+
+        // ── Pass prediction + geometry ─────────────────────────────────────
         const nowSecs = Math.floor(Date.now() / 1000);
         const noradId = parseInt(issTleData.line1.substring(2, 7).trim(), 10);
         const tleLike = { name: issTleData.name, noradId, line1: issTleData.line1, line2: issTleData.line2, constellation: 'iss' as const };
         const passes  = predictPasses([tleLike], lat, lon, altM / 1000, 1, 60, 5)
           .sort((a, b) => a.startUTC - b.startUTC)
           .filter(p => p.endUTC > nowSecs);
+
         nextPasses = passes.map(p => ({
           startUTC: p.startUTC, maxUTC: p.maxUTC, endUTC: p.endUTC,
           maxEl: Math.round(p.maxEl), duration: p.duration,
         }));
-      } catch { /* skip passes */ }
+
+        const obsGd = {
+          latitude:  lat * (Math.PI / 180),
+          longitude: lon * (Math.PI / 180),
+          height:    altM / 1000,
+        };
+        const VHF_HZ = 145.800e6;
+        const C_KMS  = 299792.458;
+
+        passDetails = passes.slice(0, 3).map(p => {
+          const tAOS  = new Date(p.startUTC * 1000);
+          const tPeak = new Date(p.maxUTC   * 1000);
+          const tLOS  = new Date(p.endUTC   * 1000);
+          const laAOS  = getLookAt(satrec, tAOS,  obsGd);
+          const laPeak = getLookAt(satrec, tPeak, obsGd);
+          const laLOS  = getLookAt(satrec, tLOS,  obsGd);
+          const rrAOS  = getRangeRate(satrec, tAOS,  obsGd);
+          const rrPeak = getRangeRate(satrec, tPeak, obsGd);
+          const rrLOS  = getRangeRate(satrec, tLOS,  obsGd);
+          const dkHz   = (rr: number) => Math.round(-(VHF_HZ * rr / C_KMS) / 10) / 100;
+          return {
+            startUTC:      p.startUTC,
+            maxUTC:        p.maxUTC,
+            endUTC:        p.endUTC,
+            maxEl:         Math.round(p.maxEl),
+            duration:      p.duration,
+            startAz:       laAOS  ? Math.round(laAOS.az)    : null,
+            maxAz:         laPeak ? Math.round(laPeak.az)   : null,
+            endAz:         laLOS  ? Math.round(laLOS.az)    : null,
+            startRangeKm:  laAOS  ? Math.round(laAOS.range) : null,
+            maxRangeKm:    laPeak ? Math.round(laPeak.range): null,
+            endRangeKm:    laLOS  ? Math.round(laLOS.range) : null,
+            aosDopplerKhz:  dkHz(rrAOS),
+            peakDopplerKhz: dkHz(rrPeak),
+            losDopplerKhz:  dkHz(rrLOS),
+          };
+        });
+
+      } catch (e: any) {
+        console.error('[iss] orbital computation error:', e.message);
+      }
     }
 
+    const crewRes = await crewPromise;
+    const crew    = crewRes
+      ? (crewRes.data.people as any[]).filter(p => p.craft === 'ISS').map(p => p.name as string)
+      : [];
+
     res.set('Cache-Control', 'public, max-age=10');
-    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPasses, nasaImageUrl, nasaImageTitle });
+    res.json({
+      crew, crewCount: crew.length,
+      altitudeKm, speedKmS, currentLat, currentLon,
+      nasaImageUrl, nasaImageTitle,
+      nextPasses, passDetails,
+      inclinationDeg, raanDeg, eccentricity, argPerigeeDeg,
+      meanAnomalyDeg, meanMotionRevDay, bstar, elementSet, revNumber,
+      smaKm, apogeeKm, perigeeKm, periodMin,
+      eciPosX, eciPosY, eciPosZ, eciVelX, eciVelY, eciVelZ,
+      solarStatus, timeToTransitionSecs, betaAngleDeg,
+      tleEpochUTC, tleAgeHours, tleLine1, tleLine2,
+    });
   } catch (err: any) {
     console.error('[iss] error:', err.message);
     res.status(500).json({ error: err.message });
