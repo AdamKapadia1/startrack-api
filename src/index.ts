@@ -1210,7 +1210,7 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
     let eciVelX = 0, eciVelY = 0, eciVelZ = 0;
     let inclinationDeg = 0, raanDeg = 0, eccentricity = 0, argPerigeeDeg = 0;
     let meanAnomalyDeg = 0, meanMotionRevDay = 0, bstar = 0, elementSet = 0, revNumber = 0;
-    let smaKm = 0, apogeeKm = 0, perigeeKm = 0, periodMin = 0;
+    let smaKm: number | null = null, apogeeKm: number | null = null, perigeeKm: number | null = null, periodMin: number | null = null;
     let solarStatus: 'SUNLIT' | 'ECLIPSE' = 'SUNLIT';
     let timeToTransitionSecs: number | null = null;
     let betaAngleDeg = 0;
@@ -1255,19 +1255,24 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
         eccentricity     = sr.ecco;
         argPerigeeDeg    = sr.argpo    * (180 / Math.PI);
         meanAnomalyDeg   = sr.mo       * (180 / Math.PI);
-        meanMotionRevDay = sr.no_kozai * (1440 / (2 * Math.PI));
         bstar            = sr.bstar;
         elementSet       = sr.elnum  ?? 0;
         revNumber        = sr.revnum ?? 0;
 
         // ── Derived orbital parameters ─────────────────────────────────────
+        // no_kozai = Kozai mean motion (rad/min) from TLE; fall back to
+        // corrected no if the property isn't exposed by this satellite.js build
+        const no_km   = (sr.no_kozai != null && sr.no_kozai !== 0) ? sr.no_kozai : sr.no;
+        meanMotionRevDay = no_km * (1440 / (2 * Math.PI));
         const mu     = 3.986004418e5;
-        const n_rads = sr.no_kozai / 60;
-        smaKm     = Math.pow(mu / (n_rads * n_rads), 1 / 3);
-        const Re  = 6378.137;
-        apogeeKm  = smaKm * (1 + eccentricity) - Re;
-        perigeeKm = smaKm * (1 - eccentricity) - Re;
-        periodMin = (2 * Math.PI) / sr.no_kozai;
+        const n_rads = no_km / 60;
+        if (isFinite(n_rads) && n_rads > 0) {
+          smaKm     = Math.pow(mu / (n_rads * n_rads), 1 / 3);
+          const Re  = 6378.137;
+          apogeeKm  = smaKm * (1 + eccentricity) - Re;
+          perigeeKm = smaKm * (1 - eccentricity) - Re;
+          periodMin = (2 * Math.PI) / no_km;
+        }
 
         // ── TLE epoch + age ────────────────────────────────────────────────
         const epochYr   = sr.epochyr   as number;
