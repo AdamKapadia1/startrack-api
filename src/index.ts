@@ -253,6 +253,18 @@ app.get('/api/tles/status', async (_req, res) => {
   catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/debug/tle-status', async (_req, res) => {
+  try {
+    await getActiveSatellites(50);
+    const status = getTleStatus();
+    res.json({
+      ...status,
+      seedFreshness: 'June 2026',
+      sources: ['CelesTrak supplemental (Starlink)', 'CelesTrak gp (OneWeb, GPS, Galileo, GLONASS, Stations)'],
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/satellites/visible', async (req: Request, res: Response) => {
   const { lat, lon, altM } = parseObs(req);
   const locationName = (req.query.name as string) ?? 'Tring, Hertfordshire';
@@ -810,22 +822,22 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       timeZone: 'Europe/London', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
 
-    const systemPrompt = `You are StarTrack AI, a satellite connectivity assistant. You have access to real-time data for the observer at Tring, Hertfordshire (51.79°N, 0.66°W, 148m altitude).
+    const systemPrompt = `You are StarTrack AI, a satellite connectivity assistant. You have access to real-time data for the observer at Tring, Hertfordshire (51.79N, 0.66W, 148m altitude).
 
 Current date and time in UK (BST): ${bstDateTime}
 Today's date: ${bstDateOnly}
 
 Current data:
-- Satellites overhead: ${sats.length} Starlink satellites
-- Best elevation: ${sats[0]?.elevation ?? 0}°
+- Satellites overhead: ${sats.length} visible satellites
+- Best elevation: ${sats[0]?.elevation ?? 0} degrees
 - Signal score: ${satData.signalScore ?? 0}/100
-- Weather: ${weatherData.description ?? 'unknown'}, ${weatherData.cloudCover ?? 0}% cloud cover, ${weatherData.temp ?? 0}°C
+- Weather: ${weatherData.description ?? 'unknown'}, ${weatherData.cloudCover ?? 0}% cloud cover, ${weatherData.temp ?? 0} degrees Celsius
 - Visible satellites:
 ${satList || '  (none)'}
 - Upcoming passes (all times in BST/Europe/London):
 ${passList || '  (none scheduled)'}
 
-Answer the user's question conversationally and precisely. Use the real data above. Be concise — 2–3 sentences maximum unless a detailed answer is needed. Always refer to dates relative to today (${bstDateOnly}). All pass times are in BST. Never mention a pass that is in the past. If asked about passes, always include exact BST times.`;
+Answer the user's question conversationally and precisely. Use the real data above. Be concise, 2 to 3 sentences maximum unless a detailed answer is needed. Always refer to dates relative to today (${bstDateOnly}). All pass times are in BST. Never mention a pass that is in the past. If asked about passes, always include exact BST times. Use British English spellings (e.g. colour, centre, metre, whilst). Do not use em dashes or en dashes in your response.`;
 
     if (closed) { res.end(); return; }
 
@@ -848,7 +860,10 @@ Answer the user's question conversationally and precisely. Use the real data abo
         event.delta.type === 'text_delta' &&
         event.delta.text
       ) {
-        res.write(`data: ${JSON.stringify({ chunk: event.delta.text })}\n\n`);
+        const chunk = event.delta.text
+          .replace(/—/g, ',')   // em dash
+          .replace(/–/g, '-');  // en dash
+        res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
       }
     }
 

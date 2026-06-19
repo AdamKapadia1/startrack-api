@@ -29,6 +29,9 @@ function loadSeedFile(filename: string): SeedEntry[] {
 
 const _seedByConstellation: Record<string, SeedEntry[]> = {
   starlink: loadSeedFile('starlink-seed.json'),
+  oneweb:   loadSeedFile('oneweb-seed.json'),
+  iss:      loadSeedFile('iss-seed.json'),
+  gps:      loadSeedFile('gps-seed.json'),
   galileo:  loadSeedFile('galileo-seed.json'),
   glonass:  loadSeedFile('glonass-seed.json'),
 };
@@ -153,43 +156,42 @@ function refreshInBackground() {
   if (_refreshing) return;
   _refreshing = true;
 
-  Promise.allSettled(TLE_SOURCES.map(src => fetchOneSource(src.label, src.constellation, src.urls)))
-    .then(results => {
-      // Merge all constellations, deduplicate by NORAD ID. A rejected/empty
-      // source falls back to its bundled seed data so one bad fetch (e.g.
-      // Galileo down) never removes a constellation from the map entirely.
-      const merged: TleEntry[] = [];
-      const seen = new Set<number>();
+  // Sequential fetches with 1 s delay between requests — CelesTrak rate limits
+  // parallel requests from server IPs. If a live fetch fails the seed fallback
+  // keeps that constellation on the map.
+  (async () => {
+    const merged: TleEntry[] = [];
+    const seen = new Set<number>();
 
-      results.forEach((result, i) => {
-        const src = TLE_SOURCES[i];
-        let entries: TleEntry[];
-        if (result.status === 'rejected') {
-          console.warn(`[tleCache] ${src.label}: fetch rejected:`, result.reason);
-          entries = seedFallbackFor(src.constellation);
-        } else if (result.value.length === 0) {
-          entries = seedFallbackFor(src.constellation);
-        } else {
-          entries = result.value;
+    for (const src of TLE_SOURCES) {
+      let entries = await fetchOneSource(src.label, src.constellation, src.urls);
+      if (entries.length === 0) entries = seedFallbackFor(src.constellation);
+      for (const entry of entries) {
+        if (!seen.has(entry.noradId)) {
+          seen.add(entry.noradId);
+          merged.push(entry);
         }
-        for (const entry of entries) {
-          if (!seen.has(entry.noradId)) {
-            seen.add(entry.noradId);
-            merged.push(entry);
-          }
-        }
-      });
+      }
+      // Polite 1 s gap so CelesTrak does not rate-limit subsequent requests
+      await new Promise(resolve => setTimeout(resolve, 1_000));
+    }
 
-      if (merged.length > 0) {
+    if (merged.length > 0) {
+      // Never downgrade the cache — if the live fetch returns fewer satellites
+      // than the current cache (e.g. CelesTrak returned an error page for some
+      // sources), keep the existing data rather than replacing it with a subset.
+      if (merged.length >= _cache.entries.length || _cache.fetchedAt === 0) {
         _cache = { entries: merged, fetchedAt: Math.floor(Date.now() / 1000) };
         const counts = TLE_SOURCES.map(src =>
           `${src.label}: ${merged.filter(e => e.constellation === src.constellation).length}`,
         ).join(', ');
-        console.log(`[tleCache] Refreshed: ${merged.length} total — ${counts}`);
-        // Clear visible-satellite cache so next request re-propagates all new TLEs
+        console.log(`[tleCache] Refreshed: ${merged.length} total. ${counts}`);
         _onRefresh?.();
+      } else {
+        console.warn(`[tleCache] Refresh returned ${merged.length} vs current ${_cache.entries.length}, keeping existing cache`);
       }
-    })
+    }
+  })()
     .catch(err => console.error('[tleCache] Background refresh failed:', err.message))
     .finally(() => { _refreshing = false; });
 }
