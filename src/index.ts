@@ -1010,13 +1010,14 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
 
 // ── ISS info ──────────────────────────────────────────────────────────────────
 
-// User-specified exterior ISS asset IDs — tried first via NASA Image Library manifest
+// Verified exterior ISS asset IDs — rotated by day of month
 const ISS_EXTERIOR_ASSETS = [
-  'iss040e013377',
-  'iss040e013376',
-  'iss040e013378',
-  'iss025e013923',
-  'iss024e005949',
+  'iss066e081189',   // ISS exterior with Earth curvature
+  'iss073-s-001',    // Expedition 73 orbital path
+  'iss064e004546',   // Crew Dragon approaching ISS
+  'iss071e416851',   // Northrop Grumman Cygnus approaching ISS
+  'iss067e176807',   // Rio de Janeiro from ISS
+  'iss038e020390',   // Astronaut EVA spacewalk outside ISS
 ];
 
 // Verified 200-OK CDN URLs used as fallback when manifest assets fail
@@ -1034,38 +1035,43 @@ const ISS_VERIFIED_PHOTOS = [
 
 let lastServedAssetId: string | null = null;
 
-// Proxy endpoint — tries asset manifest first, falls back to verified CDN list
+// Proxy endpoint — picks today's asset by day-of-month, falls back to verified CDN list
 app.get('/api/iss/photo', async (_req: Request, res: Response) => {
-  // Attempt each user-specified asset ID via the NASA Image Library manifest
-  for (const assetId of ISS_EXTERIOR_ASSETS) {
+  // Day-of-month selection
+  const idx     = new Date().getDate() % ISS_EXTERIOR_ASSETS.length;
+  const assetId = ISS_EXTERIOR_ASSETS[idx];
+
+  const assetRes = await axios.get(
+    `https://images-api.nasa.gov/asset/${assetId}`,
+    { timeout: 8_000 },
+  ).catch(() => null);
+
+  const items    = assetRes?.data?.collection?.items ?? [];
+  const imageUrl: string | null = items.find((i: any) =>
+    i.href?.includes('large') || i.href?.endsWith('.jpg'),
+  )?.href ?? null;
+
+  console.log('[iss] photo:', imageUrl);
+
+  if (imageUrl) {
     try {
-      const manifest = await axios.get(
-        `https://images-api.nasa.gov/asset/${assetId}`,
-        { timeout: 8_000 },
-      );
-      const items: Array<{ href: string }> = manifest.data?.collection?.items ?? [];
-      const imageHref = items.find(i => i.href?.endsWith('~large.jpg'))?.href
-        ?? items.find(i => i.href?.endsWith('~medium.jpg'))?.href;
-      if (imageHref) {
-        const img = await axios.get(imageHref, { responseType: 'arraybuffer', timeout: 12_000 });
-        res.set('Content-Type', 'image/jpeg');
-        res.set('Cache-Control', 'no-cache');
-        res.set('X-Asset-Id', assetId);
-        lastServedAssetId = assetId;
-        console.log(`[iss/photo] served manifest asset ${assetId}`);
-        res.send(img.data);
-        return;
-      }
+      const img = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 12_000 });
+      res.set('Content-Type', 'image/jpeg');
+      res.set('Cache-Control', 'no-cache');
+      res.set('X-Asset-Id', assetId);
+      lastServedAssetId = assetId;
+      res.send(img.data);
+      return;
     } catch (err: any) {
-      console.warn(`[iss/photo] manifest ${assetId} failed: ${err.message}`);
+      console.warn(`[iss/photo] fetch failed for ${assetId}: ${err.message}`);
     }
   }
 
   // Fallback: rotate through verified CDN URLs
   lastServedAssetId = null;
-  const idx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
+  const fallbackIdx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
   for (let i = 0; i < ISS_VERIFIED_PHOTOS.length; i++) {
-    const url = ISS_VERIFIED_PHOTOS[(idx + i) % ISS_VERIFIED_PHOTOS.length];
+    const url = ISS_VERIFIED_PHOTOS[(fallbackIdx + i) % ISS_VERIFIED_PHOTOS.length];
     try {
       const img = await axios.get(url, { responseType: 'arraybuffer', timeout: 10_000 });
       res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
