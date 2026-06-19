@@ -1038,7 +1038,7 @@ app.get('/api/iss/info', async (req, res) => {
         let nasaImage = null;
         let nasaImageTitle = null;
         try {
-            const nasaRes = await axios_1.default.get('https://images-api.nasa.gov/search?q=international+space+station&media_type=image&year_start=2022&page_size=20', { timeout: 8000 });
+            const nasaRes = await axios_1.default.get('https://images-api.nasa.gov/search?q=ISS+exterior+orbit&media_type=image&year_start=2020&page_size=20', { timeout: 8000 });
             const items = nasaRes.data?.collection?.items ?? [];
             if (items.length > 0) {
                 const dayIndex = new Date().getDate() % items.length;
