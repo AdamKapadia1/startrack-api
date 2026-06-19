@@ -1043,6 +1043,34 @@ app.get('/api/iss/photo', async (_req, res) => {
         }
     }
 });
+app.get('/api/iss/track', async (_req, res) => {
+    if (!issTleData) {
+        res.json({ points: [] });
+        return;
+    }
+    try {
+        const satrec = satelliteJs.twoline2satrec(issTleData.line1, issTleData.line2);
+        const points = [];
+        const now = new Date();
+        for (let i = 0; i <= 30; i++) {
+            const t = new Date(now.getTime() + i * 60000);
+            const pv = satelliteJs.propagate(satrec, t);
+            if (pv && pv.position && typeof pv.position !== 'boolean') {
+                const gmst = satelliteJs.gstime(t);
+                const geo = satelliteJs.eciToGeodetic(pv.position, gmst);
+                points.push({
+                    lat: parseFloat(satelliteJs.degreesLat(geo.latitude).toFixed(2)),
+                    lon: parseFloat(satelliteJs.degreesLong(geo.longitude).toFixed(2)),
+                });
+            }
+        }
+        res.set('Cache-Control', 'public, max-age=30');
+        res.json({ points });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 app.get('/api/iss/info', async (req, res) => {
     try {
         const { lat, lon, altM } = parseObs(req);
@@ -1086,23 +1114,25 @@ app.get('/api/iss/info', async (req, res) => {
                 console.error('[iss] SGP4 error:', e.message);
             }
         }
-        // ── Next pass (uses issTleData formatted as a TLE cache entry) ─────────────
-        let nextPass = null;
+        // ── All passes in next 24 h (uses issTleData, min 5°) ─────────────────────
+        let nextPasses = [];
         if (issTleData) {
             try {
+                const nowSecs = Math.floor(Date.now() / 1000);
                 const noradId = parseInt(issTleData.line1.substring(2, 7).trim(), 10);
                 const tleLike = { name: issTleData.name, noradId, line1: issTleData.line1, line2: issTleData.line2, constellation: 'iss' };
-                const passes = (0, passPredictor_js_1.predictPasses)([tleLike], lat, lon, altM / 1000, 3, 60, 10)
-                    .sort((a, b) => a.startUTC - b.startUTC);
-                if (passes.length > 0) {
-                    const p = passes[0];
-                    nextPass = { startUTC: p.startUTC, maxUTC: p.maxUTC, endUTC: p.endUTC, maxEl: Math.round(p.maxEl), duration: p.duration };
-                }
+                const passes = (0, passPredictor_js_1.predictPasses)([tleLike], lat, lon, altM / 1000, 1, 60, 5)
+                    .sort((a, b) => a.startUTC - b.startUTC)
+                    .filter(p => p.endUTC > nowSecs);
+                nextPasses = passes.map(p => ({
+                    startUTC: p.startUTC, maxUTC: p.maxUTC, endUTC: p.endUTC,
+                    maxEl: Math.round(p.maxEl), duration: p.duration,
+                }));
             }
-            catch { /* skip pass */ }
+            catch { /* skip passes */ }
         }
-        res.set('Cache-Control', 'public, max-age=60');
-        res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl, nasaImageTitle });
+        res.set('Cache-Control', 'public, max-age=10');
+        res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPasses, nasaImageUrl, nasaImageTitle });
     }
     catch (err) {
         console.error('[iss] error:', err.message);
