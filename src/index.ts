@@ -1038,6 +1038,21 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
         .map(p => p.name as string);
     } catch { /* leave crew empty — not critical */ }
 
+    // ── NASA APOD image ────────────────────────────────────────────────────────
+    let nasaImage: string | null = null;
+    let nasaImageTitle: string | null = null;
+    try {
+      const apodRes = await axios.get(
+        'https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=1',
+        { timeout: 5_000 },
+      );
+      const item = apodRes.data?.[0];
+      if (item?.media_type === 'image') {
+        nasaImage = item.url || null;
+        nasaImageTitle = item.title || null;
+      }
+    } catch { /* use null */ }
+
     // ── SGP4 position + speed ──────────────────────────────────────────────────
     let altitudeKm:  number | null = null;
     let speedKmS:    number | null = null;
@@ -1086,11 +1101,8 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
       } catch { /* skip pass */ }
     }
 
-    // Return a stable proxy URL — browser hits Railway, Railway hits NASA
-    const nasaImageUrl = '/api/iss/photo';
-
     res.set('Cache-Control', 'public, max-age=60');
-    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl });
+    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImage, nasaImageTitle });
   } catch (err: any) {
     console.error('[iss] error:', err.message);
     res.status(500).json({ error: err.message });
