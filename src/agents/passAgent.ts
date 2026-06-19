@@ -108,6 +108,17 @@ function obsKey(obs: Obs) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Replaces all dash variants used as clause separators with ", ".
+// Covers: U+2014 em dash, U+2013 en dash, U+2015 horizontal bar, U+2212 minus sign.
+// Handles spaced (" — "), leading-spaced (" —"), trailing-spaced ("— "), and
+// unspaced ("—") forms. Collapses any double spaces left after replacement.
+function sanitiseDashes(text: string): string {
+  return text
+    .replace(/ *[—–―−] */g, ', ')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+}
+
 function utcToLocal(utc: number): string {
   return new Date(utc * 1000).toLocaleTimeString('en-GB', {
     hour:     '2-digit',
@@ -357,14 +368,14 @@ export async function getPassRecommendation(
         thinking:   { type: 'adaptive' },
         messages: [{
           role:    'user',
-          content: `You are a satellite connectivity assistant. Current date and time in UK (BST): ${bstFallbackNow}\n\nScheduled pass data is temporarily being computed. However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2–3 sentences assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data will be available shortly.`,
+          content: `You are a satellite connectivity assistant. Current date and time in UK (BST): ${bstFallbackNow}\n\nScheduled pass data is temporarily being computed. However, there are currently ${currentSatellites.length} Starlink satellites visible overhead from ${locationName}:\n\n${satList}\n\nWrite 2 to 3 sentences in British English assessing current connectivity based on what is overhead right now. Focus on the highest-elevation satellite. Mention that scheduled pass data will be available shortly. Do not use em dashes, en dashes, or any long dash symbol. Use commas or full stops to join clauses instead.`,
         }],
       });
 
       const response = await stream.finalMessage();
       let recommendation = '';
       for (const block of response.content) {
-        if (block.type === 'text') { recommendation = block.text; break; }
+        if (block.type === 'text') { recommendation = sanitiseDashes(block.text); break; }
       }
 
       return {
@@ -418,7 +429,7 @@ export async function getPassRecommendation(
     messages: [
       {
         role:    'user',
-        content: `You are a satellite connectivity assistant tracking Starlink satellites over ${locationName}.\n\nCurrent date and time in UK (BST): ${bstNow}\n\nHere are the top upcoming passes over the next 7 days (all times in BST/Europe/London):\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2–3 sentence plain-English recommendation. Identify the single best connectivity window of the entire week — name the satellite, date, time in BST, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.). Always refer to dates relative to today.`,
+        content: `You are a satellite connectivity assistant tracking Starlink satellites over ${locationName}.\n\nCurrent date and time in UK (BST): ${bstNow}\n\nHere are the top upcoming passes over the next 7 days (all times in BST/Europe/London):\n\n${passDescriptions}\n\n${bestDesc}\n\nWrite a 2 to 3 sentence plain-English recommendation in British English. Identify the single best connectivity window of the entire week: name the satellite, date, time in BST, and peak elevation. Mention what it is ideal for (video calls, IoT sync, etc.). Always refer to dates relative to today. Do not use em dashes, en dashes, or any long dash symbol. Use commas or full stops to join clauses instead.`,
       },
     ],
   });
@@ -427,7 +438,7 @@ export async function getPassRecommendation(
 
   let recommendation = '';
   for (const block of response.content) {
-    if (block.type === 'text') { recommendation = block.text; break; }
+    if (block.type === 'text') { recommendation = sanitiseDashes(block.text); break; }
   }
 
   return {
@@ -613,7 +624,7 @@ ${worstStr}
 
 Overall trend: ${trendWord} (first half avg: ${avgFirst}, second half avg: ${avgSecond})
 
-Write a 2-3 sentence insight for the user about when they get the best connectivity, in a friendly, specific tone. Mention actual times. Example style: 'Your best connectivity is consistently between 10pm and 2am, likely due to favourable orbital geometry during those hours. Avoid scheduling important calls between 2pm-4pm when signal tends to be weakest.'`;
+Write a 2 to 3 sentence insight in British English about when the user gets the best connectivity, in a friendly, specific tone. Mention actual times. Do not use em dashes, en dashes, or any long dash symbol. Use commas or full stops to join clauses instead. Example style: 'Your best connectivity is consistently between 10pm and 2am, likely due to favourable orbital geometry during those hours. Avoid scheduling important calls between 2pm and 4pm when signal tends to be weakest.'`;
 
   const client = new Anthropic();
   const stream = client.messages.stream({
@@ -626,7 +637,7 @@ Write a 2-3 sentence insight for the user about when they get the best connectiv
   const resp = await stream.finalMessage();
   let insight = '';
   for (const block of resp.content) {
-    if (block.type === 'text') { insight = block.text; break; }
+    if (block.type === 'text') { insight = sanitiseDashes(block.text); break; }
   }
 
   return { available: true, insight, bestHours, worstHours, trend, hourlyScores };
