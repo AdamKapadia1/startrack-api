@@ -1034,18 +1034,22 @@ app.get('/api/iss/info', async (req, res) => {
                 .map(p => p.name);
         }
         catch { /* leave crew empty — not critical */ }
-        // ── NASA APOD image ────────────────────────────────────────────────────────
+        // ── NASA Image and Video Library (free, no key) ────────────────────────────
         let nasaImage = null;
         let nasaImageTitle = null;
         try {
-            const apodRes = await axios_1.default.get('https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=1', { timeout: 5000 });
-            const item = apodRes.data?.[0];
-            if (item?.media_type === 'image') {
-                nasaImage = item.url || null;
-                nasaImageTitle = item.title || null;
+            const nasaRes = await axios_1.default.get('https://images-api.nasa.gov/search?q=international+space+station&media_type=image&year_start=2022&page_size=20', { timeout: 8000 });
+            const items = nasaRes.data?.collection?.items ?? [];
+            if (items.length > 0) {
+                const dayIndex = new Date().getDate() % items.length;
+                const item = items[dayIndex];
+                nasaImage = item?.links?.[0]?.href || null;
+                nasaImageTitle = item?.data?.[0]?.title || null;
             }
         }
         catch { /* use null */ }
+        console.log('[iss] NASA image URL:', nasaImage);
+        console.log('[iss] NASA image title:', nasaImageTitle);
         // ── SGP4 position + speed ──────────────────────────────────────────────────
         let altitudeKm = null;
         let speedKmS = null;
@@ -1092,7 +1096,7 @@ app.get('/api/iss/info', async (req, res) => {
             catch { /* skip pass */ }
         }
         res.set('Cache-Control', 'public, max-age=60');
-        res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImage, nasaImageTitle });
+        res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl: nasaImage, nasaImageTitle });
     }
     catch (err) {
         console.error('[iss] error:', err.message);

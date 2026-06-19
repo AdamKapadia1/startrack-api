@@ -1038,20 +1038,24 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
         .map(p => p.name as string);
     } catch { /* leave crew empty — not critical */ }
 
-    // ── NASA APOD image ────────────────────────────────────────────────────────
+    // ── NASA Image and Video Library (free, no key) ────────────────────────────
     let nasaImage: string | null = null;
     let nasaImageTitle: string | null = null;
     try {
-      const apodRes = await axios.get(
-        'https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=1',
-        { timeout: 5_000 },
+      const nasaRes = await axios.get(
+        'https://images-api.nasa.gov/search?q=international+space+station&media_type=image&year_start=2022&page_size=20',
+        { timeout: 8_000 },
       );
-      const item = apodRes.data?.[0];
-      if (item?.media_type === 'image') {
-        nasaImage = item.url || null;
-        nasaImageTitle = item.title || null;
+      const items: any[] = nasaRes.data?.collection?.items ?? [];
+      if (items.length > 0) {
+        const dayIndex = new Date().getDate() % items.length;
+        const item = items[dayIndex];
+        nasaImage = item?.links?.[0]?.href || null;
+        nasaImageTitle = item?.data?.[0]?.title || null;
       }
     } catch { /* use null */ }
+    console.log('[iss] NASA image URL:', nasaImage);
+    console.log('[iss] NASA image title:', nasaImageTitle);
 
     // ── SGP4 position + speed ──────────────────────────────────────────────────
     let altitudeKm:  number | null = null;
@@ -1102,7 +1106,7 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
     }
 
     res.set('Cache-Control', 'public, max-age=60');
-    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImage, nasaImageTitle });
+    res.json({ crew, crewCount: crew.length, altitudeKm, speedKmS, currentLat, currentLon, nextPass, nasaImageUrl: nasaImage, nasaImageTitle });
   } catch (err: any) {
     console.error('[iss] error:', err.message);
     res.status(500).json({ error: err.message });
