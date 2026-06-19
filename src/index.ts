@@ -1010,34 +1010,19 @@ app.get('/api/satellites/groundtrack', async (req: Request, res: Response) => {
 
 // ── ISS info ──────────────────────────────────────────────────────────────────
 
-// Verified exterior ISS asset IDs — rotated by day of month
+// Confirmed exterior ISS asset IDs (rotated by day of month)
 const ISS_EXTERIOR_ASSETS = [
-  'iss066e081189',   // ISS exterior with Earth curvature
-  'iss073-s-001',    // Expedition 73 orbital path
-  'iss064e004546',   // Crew Dragon approaching ISS
-  'iss071e416851',   // Northrop Grumman Cygnus approaching ISS
-  'iss067e176807',   // Rio de Janeiro from ISS
-  'iss038e020390',   // Astronaut EVA spacewalk outside ISS
-];
-
-// Verified 200-OK CDN URLs used as fallback when manifest assets fail
-const ISS_VERIFIED_PHOTOS = [
-  'https://images-assets.nasa.gov/image/iss074e0403089/iss074e0403089~large.jpg',
-  'https://images-assets.nasa.gov/image/iss073e0982217/iss073e0982217~large.jpg',
-  'https://images-assets.nasa.gov/image/iss072e576465/iss072e576465~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss072e575553/iss072e575553~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss064e030164/iss064e030164~large.jpg',
-  'https://images-assets.nasa.gov/image/iss061e006843/iss061e006843~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss061e006834/iss061e006834~medium.jpg',
-  'https://images-assets.nasa.gov/image/iss059e035608/iss059e035608~large.jpg',
-  'https://images-assets.nasa.gov/image/iss058e007453/iss058e007453~large.jpg',
+  'iss040e013377',
+  'iss040e013376',
+  'iss040e013378',
+  'iss025e013923',
+  'iss024e005949',
 ];
 
 let lastServedAssetId: string | null = null;
 
-// Proxy endpoint — picks today's asset by day-of-month, falls back to verified CDN list
+// Proxy endpoint: picks today's asset by day-of-month index
 app.get('/api/iss/photo', async (_req: Request, res: Response) => {
-  // Day-of-month selection
   const idx     = new Date().getDate() % ISS_EXTERIOR_ASSETS.length;
   const assetId = ISS_EXTERIOR_ASSETS[idx];
 
@@ -1048,10 +1033,10 @@ app.get('/api/iss/photo', async (_req: Request, res: Response) => {
 
   const items    = assetRes?.data?.collection?.items ?? [];
   const imageUrl: string | null = items.find((i: any) =>
-    i.href?.includes('large') || i.href?.endsWith('.jpg'),
+    i.href?.includes('large') || i.href?.includes('orig'),
   )?.href ?? null;
 
-  console.log('[iss] photo:', imageUrl);
+  console.log('[iss/photo] asset:', assetId, 'url:', imageUrl);
 
   if (imageUrl) {
     try {
@@ -1067,19 +1052,6 @@ app.get('/api/iss/photo', async (_req: Request, res: Response) => {
     }
   }
 
-  // Fallback: rotate through verified CDN URLs
-  lastServedAssetId = null;
-  const fallbackIdx = Math.floor(Math.random() * ISS_VERIFIED_PHOTOS.length);
-  for (let i = 0; i < ISS_VERIFIED_PHOTOS.length; i++) {
-    const url = ISS_VERIFIED_PHOTOS[(fallbackIdx + i) % ISS_VERIFIED_PHOTOS.length];
-    try {
-      const img = await axios.get(url, { responseType: 'arraybuffer', timeout: 10_000 });
-      res.set('Content-Type', String(img.headers['content-type'] ?? 'image/jpeg'));
-      res.set('Cache-Control', 'no-cache');
-      res.send(img.data);
-      return;
-    } catch { /* try next */ }
-  }
   res.status(503).json({ error: 'photo unavailable' });
 });
 
@@ -1201,7 +1173,7 @@ app.get('/api/iss/info', async (req: Request, res: Response) => {
     const crewPromise = axios.get('http://api.open-notify.org/astros.json', { timeout: 6_000 }).catch(() => null);
 
     const nasaImageUrl   = `${RAILWAY_URL}/api/iss/photo`;
-    const nasaImageTitle = lastServedAssetId ? `NASA/JSC — ${lastServedAssetId}` : 'ISS exterior — NASA';
+    const nasaImageTitle = lastServedAssetId ? `NASA/JSC: ${lastServedAssetId}` : 'ISS exterior, NASA';
 
     // Defaults
     let altitudeKm: number | null = null, speedKmS: number | null = null;
