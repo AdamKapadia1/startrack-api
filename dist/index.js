@@ -346,6 +346,47 @@ app.post('/api/notifications/favourites', (req, res) => {
     console.log(`[favourites] synced ${satelliteNames.length} favourite satellite names to alert config`);
     res.json({ saved: true, count: satelliteNames.length, config: updated });
 });
+app.post('/api/notifications/location', async (req, res) => {
+    // Require a Supabase user JWT in the Authorization header.
+    // Unauthenticated callers (guests, missing header) get a silent no-op, not an error.
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ') || !supabase) {
+        res.json({ saved: false });
+        return;
+    }
+    const token = authHeader.slice(7);
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+        res.json({ saved: false });
+        return;
+    }
+    const { lat, lon, alt, name } = req.body;
+    if (typeof lat !== 'number' || typeof lon !== 'number' || typeof alt !== 'number') {
+        res.status(400).json({ error: 'lat, lon, alt must be numbers' });
+        return;
+    }
+    // Use a per-request client authenticated as the user so RLS evaluates auth.uid() correctly.
+    const userSb = (0, supabase_js_1.createClient)(_supabaseUrl, _supabaseKey, {
+        global: { headers: { Authorization: `Bearer ${token}` } },
+    });
+    const { error } = await userSb
+        .from('app_settings')
+        .upsert({
+        user_id: user.id,
+        lat,
+        lon,
+        alt,
+        name: name ?? '',
+        updated_at: new Date().toISOString(),
+    });
+    if (error) {
+        console.error('[location] Supabase upsert failed:', error.message);
+        res.status(500).json({ error: error.message });
+        return;
+    }
+    console.log(`[location] observer saved: ${lat.toFixed(4)},${lon.toFixed(4)} for user ${user.id.slice(0, 8)}`);
+    res.json({ saved: true, lat, lon, alt });
+});
 app.get('/api/digest/send-now', async (_req, res) => {
     try {
         res.json(await (0, passAgent_js_1.sendDailyDigest)());
