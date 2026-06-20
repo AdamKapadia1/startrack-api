@@ -258,16 +258,18 @@ export async function checkAndNotify(): Promise<NotificationCheckResult> {
 
   // Resolve observer location: read from Supabase app_settings at check time so the location
   // survives Railway redeploys. Falls back to DEFAULT_OBS (Tring) when Supabase is unavailable.
+  // Uses the anon key with anon_select policy. Takes the most recently updated row.
   let obs: Obs = DEFAULT_OBS;
   const sb = _getSupabase();
   if (sb) {
-    const { data: settingsRow } = await sb
+    const { data: locationRow } = await sb
       .from('app_settings')
-      .select('value')
-      .eq('key', 'observer')
+      .select('lat, lon, alt')
+      .order('updated_at', { ascending: false })
+      .limit(1)
       .maybeSingle();
-    if (settingsRow?.value) {
-      const { lat, lon, alt } = settingsRow.value as { lat?: number; lon?: number; alt?: number };
+    if (locationRow) {
+      const { lat, lon, alt } = locationRow as { lat?: number; lon?: number; alt?: number };
       if (typeof lat === 'number' && typeof lon === 'number' && typeof alt === 'number') {
         obs = { lat, lon, alt };
         console.log(`[passAgent] observer from Supabase: ${lat.toFixed(4)},${lon.toFixed(4)}`);
