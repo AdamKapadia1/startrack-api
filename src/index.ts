@@ -335,6 +335,24 @@ app.post('/api/notifications/favourites', (req: Request, res: Response) => {
   res.json({ saved: true, count: satelliteNames.length, config: updated });
 });
 
+app.post('/api/notifications/location', async (req: Request, res: Response) => {
+  const { lat, lon, alt, name } = req.body;
+  if (typeof lat !== 'number' || typeof lon !== 'number' || typeof alt !== 'number') {
+    res.status(400).json({ error: 'lat, lon, alt must be numbers' }); return;
+  }
+  if (supabase) {
+    const { error } = await supabase
+      .from('app_settings')
+      .upsert({ key: 'observer', value: { lat, lon, alt, name: name ?? '' }, updated_at: new Date().toISOString() });
+    if (error) {
+      console.error('[location] Supabase upsert failed:', error.message);
+      res.status(500).json({ error: error.message }); return;
+    }
+    console.log(`[location] observer saved to Supabase: ${lat.toFixed(4)},${lon.toFixed(4)}`);
+  }
+  res.json({ saved: true, lat, lon, alt });
+});
+
 app.get('/api/digest/send-now', async (_req, res) => {
   try { res.json(await sendDailyDigest()); }
   catch (err: any) { res.status(500).json({ error: err.message }); }

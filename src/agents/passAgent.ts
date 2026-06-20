@@ -254,22 +254,56 @@ setInterval(() => {
 export async function checkAndNotify(): Promise<NotificationCheckResult> {
   if (!alertConfig.enabled) return { checked: 0, alerted: 0, alerts: [] };
 
-  const isFavMode = alertConfig.favouriteSatellitesOnly && alertConfig.favouriteSatelliteNames.length > 0;
+  const isFavMode = alertConfig.favouriteSatellitesOnly;
+
+  // Resolve observer location: read from Supabase app_settings at check time so the location
+  // survives Railway redeploys. Falls back to DEFAULT_OBS (Tring) when Supabase is unavailable.
+  let obs: Obs = DEFAULT_OBS;
+  const sb = _getSupabase();
+  if (sb) {
+    const { data: settingsRow } = await sb
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'observer')
+      .maybeSingle();
+    if (settingsRow?.value) {
+      const { lat, lon, alt } = settingsRow.value as { lat?: number; lon?: number; alt?: number };
+      if (typeof lat === 'number' && typeof lon === 'number' && typeof alt === 'number') {
+        obs = { lat, lon, alt };
+        console.log(`[passAgent] observer from Supabase: ${lat.toFixed(4)},${lon.toFixed(4)}`);
+      }
+    }
+  }
 
   let passes: Pass[];
 
   if (isFavMode) {
-    // Run pass prediction specifically for the named favourite satellites at a low min elevation (10°)
+    // Read favourite satellite names from Supabase at check time so the list survives redeploys
+    // and does not depend on a client POST having been made since the last Railway deployment.
+    // Falls back to in-memory alertConfig.favouriteSatelliteNames when Supabase is unavailable.
+    let favNames: string[] = [];
+    if (sb) {
+      const { data: favRows } = await sb
+        .from('favourite_satellites')
+        .select('satellite_name');
+      favNames = (favRows ?? []).map((r: { satellite_name: string }) => r.satellite_name.toUpperCase());
+      console.log(`[passAgent] favourites from Supabase: ${favNames.length} satellites`);
+    }
+    if (favNames.length === 0) {
+      favNames = alertConfig.favouriteSatelliteNames.map(n => n.toUpperCase());
+      console.log(`[passAgent] favourites fallback to in-memory: ${favNames.length} satellites`);
+    }
+    if (favNames.length === 0) return { checked: 0, alerted: 0, alerts: [] };
+
     await getActiveSatellites(1);
-    const allTles  = getAllSatellites();
-    const favNames = alertConfig.favouriteSatelliteNames.map(n => n.toUpperCase());
-    const favTles  = allTles.filter(t => favNames.includes(t.name.toUpperCase()));
-    const altKm    = DEFAULT_OBS.alt / 1000;
-    const raw      = predictPasses(favTles, DEFAULT_OBS.lat, DEFAULT_OBS.lon, altKm, 7, 120, 10);
+    const allTles = getAllSatellites();
+    const favTles = allTles.filter(t => favNames.includes(t.name.toUpperCase()));
+    const altKm   = obs.alt / 1000;
+    const raw     = predictPasses(favTles, obs.lat, obs.lon, altKm, 7, 120, 10);
     passes = (raw as Pass[]).sort((a, b) => b.maxEl - a.maxEl);
-    console.log(`[passAgent] favourites mode: ${favTles.length} TLEs matched, ${passes.length} passes found`);
+    console.log(`[passAgent] favourites mode: ${favTles.length} TLEs matched, ${passes.length} passes found at ${obs.lat.toFixed(4)},${obs.lon.toFixed(4)}`);
   } else {
-    passes = await getAllStarlinkPasses(DEFAULT_OBS);
+    passes = await getAllStarlinkPasses(obs);
   }
 
   const now          = Math.floor(Date.now() / 1000);
